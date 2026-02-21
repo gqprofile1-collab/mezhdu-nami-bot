@@ -286,11 +286,7 @@ def kb_vote(gs: GameState):
     if targets:
         b.adjust(*([cols] * ((len(targets) + cols - 1) // cols)))
 
-    # join during running (for next round), only if not full
-    if len(gs.players) < MAX_PLAYERS:
-        b.row()
-        b.button(text="➕ В игру", callback_data="join_running")
-
+    # во время вопроса НЕ добавляем кнопку входа
     b.row()
     b.button(text="🛑 Завершить", callback_data="end")
     b.adjust(1)
