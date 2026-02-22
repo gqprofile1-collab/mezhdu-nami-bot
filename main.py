@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import random
@@ -165,9 +166,10 @@ class GameState:
     voted_users: Set[int] = field(default_factory=set)
     total_votes: int = 0
 
-    extended_prompted: bool = False
-    extend_used: bool = False
-    extend_prompt_msg_id: Optional[int] = None
+    # таймер-логика продления
+    extended_prompted: bool = False  # уже показали меню "продлить?"
+    extend_used: bool = False        # уже продляли 1 раз
+    extend_prompt_msg_id: Optional[int] = None  # id сообщения "продлить?"
 
     awaiting_next: bool = False
 
@@ -179,6 +181,13 @@ class GameState:
 
 
 GAMES: Dict[int, GameState] = {}
+
+
+# =========================
+# HTML helper
+# =========================
+def h(text: str) -> str:
+    return html.escape(text or "")
 
 
 # =========================
@@ -294,47 +303,48 @@ DM_WELCOME_VARIANTS = [
     "Мини-реалити в вашем чате:\n*вопрос → голосование → итог*.\nДа, будет неловко 😏",
 ]
 
-ALREADY_VOTED_VARIANTS = [
-    "Всё, *выбор сделан* 😏",
-    "Один голос — и *живи с этим* 🤫",
-    "Поздно *переобуваться* 😈",
-    "Голос уже улетел. *Не догоняй*.",
-    "Второй попытки *не будет* 😏",
-    "Без переигровок. Я *строгий*.",
+# ВАЖНО: это используется в cb.answer (toast) => НИКАКОГО Markdown/HTML
+ALREADY_VOTED_TOASTS = [
+    "Всё, выбор сделан 😏",
+    "Один голос — и живи с этим 🤫",
+    "Поздно переобуваться 😈",
+    "Голос уже улетел. Не догоняй 😏",
+    "Второй попытки не будет 😈",
+    "Без переигровок. Я строгий 😏",
     "Ты уже отметился 😈",
     "Назад дороги нет 🤫",
     "Переобувка запрещена 😏",
-    "Голос засчитан. *Терпи* 😈",
+    "Голос засчитан. Терпи 😈",
 ]
 
-NEXT_VARIANTS = [
+NEXT_TOASTS = [
     "Дальше 😈",
-    "Ещё один раунд? *С удовольствием* 😏",
-    "Поехали. Сейчас будет *лучше*.",
+    "Поехали 😏",
+    "Газуем 🤫",
+    "Следующий. Держитесь 😈",
+    "Продолжаем 😏",
+    "Ещё раунд — легко 😈",
+    "Погнали 😏",
     "Не тормозим 🤫",
-    "Продолжаем — и *не краснеем* 😈",
-    "Следующий. *Держитесь*.",
-    "Ок, жмём газ 😏",
-    "Вперёд. Я только разогрелся 😈",
-    "Ещё вопросик — и кто-то *вскроется* 🤫",
-    "Погнали. Без лишних слов 😏",
+    "Ок, следующий 😈",
+    "Вперёд 😏",
 ]
 
 END_VARIANTS = [
-    "Было *опасно приятно* 😈 Возвращайтесь.",
-    "Ну всё, красавчики. Захотите ещё — *зовите* 😏",
-    "Игра окончена. *Обиды не хранить*. Почти 🤫",
-    "Разошлись красиво. Но я всё *запомнил* 😈",
-    "Спасибо за игру. В следующий раз будет *ещё больнее* 😏",
-    "Конец. И да — это *между нами* 🤫",
+    "Было <b>опасно приятно</b> 😈 Возвращайтесь.",
+    "Ну всё, красавчики. Захотите ещё — <b>зовите</b> 😏",
+    "Игра окончена. <b>Обиды не хранить</b>. Почти 🤫",
+    "Разошлись красиво. Но я всё <b>запомнил</b> 😈",
+    "Спасибо за игру. В следующий раз будет <b>ещё больнее</b> 😏",
+    "Конец. И да — это <b>между нами</b> 🤫",
     "Пауза на жизнь. Потом продолжим 😈",
-    "Вы держались достойно. *Почти* 😏",
+    "Вы держались достойно. <b>Почти</b> 😏",
     "Игра закрыта. Кто обиделся — тот проиграл 🤫",
     "До встречи. Я рядом, когда станет скучно 😈",
 ]
 
 INACTIVE_END_VARIANTS = [
-    "*10 минут тишины*… я понял 🫠\nЗакрываю игру. Вернётесь — продолжим 😈",
+    "<b>10 минут тишины</b>… я понял 🫠\nЗакрываю игру. Вернётесь — продолжим 😈",
     "Чат ушёл в спячку 😴\nЗакрываю сессию. Но я рядом 😏",
     "Тишина слишком громкая 🤫\nЗакрываю игру.",
     "Пауза затянулась.\nЗакрываю 😈",
@@ -342,24 +352,24 @@ INACTIVE_END_VARIANTS = [
 ]
 
 TIMEUP_NO_VOTES = [
-    "*Время вышло* ⏰\nИ… никто не рискнул 😏",
-    "*Ноль голосов*.\nСлишком мило. Подозрительно 🤨",
-    "Тишина.\n*Боитесь последствий?* 😈",
+    "<b>Время вышло</b> ⏰\nИ… никто не рискнул 😏",
+    "<b>Ноль голосов</b>.\nСлишком мило. Подозрительно 🤨",
+    "Тишина.\n<b>Боитесь последствий?</b> 😈",
     "Никто не нажал.\nНу вы и осторожные 🤫",
     "Ноль.\nЯ даже разочарован 😏",
 ]
 
 TIMEUP_MISSING = [
-    "*Время вышло* ⏰\nЕщё *{missing}* молчат…",
-    "*{missing}* всё ещё “думают” 😏",
-    "Ещё *{missing}* без голоса.\nТянете драму 🤫",
-    "Жду *{missing}*.\nНо недолго 😈",
-    "Ещё *{missing}* — и считаем как есть 😏",
+    "<b>Время вышло</b> ⏰\nЕщё <b>{missing}</b> молчат…",
+    "<b>{missing}</b> всё ещё “думают” 😏",
+    "Ещё <b>{missing}</b> без голоса.\nТянете драму 🤫",
+    "Жду <b>{missing}</b>.\nНо недолго 😈",
+    "Ещё <b>{missing}</b> — и считаем как есть 😏",
 ]
 
 
 # =========================
-# DM MENU TEXTS
+# DM MENU TEXTS (Markdown)
 # =========================
 def dm_home_text() -> str:
     return (
@@ -403,13 +413,9 @@ def dm_donate_text() -> str:
 
 
 # =========================
-# DM MENU EDIT HELPER
+# DM MENU EDIT HELPER (Markdown)
 # =========================
 async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
-    """
-    Красивое меню: редактируем текущее сообщение.
-    Если редактирование невозможно — мягко шлём новое.
-    """
     try:
         await cb.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     except TelegramBadRequest as e:
@@ -461,6 +467,7 @@ def kb_vote(gs: GameState):
     b = InlineKeyboardBuilder()
     targets = [(uid, gs.players[uid]) for uid in gs.round_targets if uid in gs.players]
     targets.sort(key=lambda x: x[1].label.lower())
+
     for uid, p in targets:
         b.button(text=p.label, callback_data=f"vote:{uid}")
 
@@ -604,11 +611,10 @@ async def reminder_loop():
                 try:
                     await bot.send_message(
                         chat_id,
-                        "Эй 😏\n"
-                        "*Три дня тишины*…\n"
-                        "Может, снова сыграем в *«Между нами 🤫»*?\n\n"
-                        "Напишите: *«Начать игру»* 👇",
-                        parse_mode="Markdown",
+                        "Эй 😏\n<b>Три дня тишины</b>…\n"
+                        "Может, снова сыграем в <b>«Между нами 🤫»</b>?\n\n"
+                        "Напишите: <b>«Начать игру»</b> 👇",
+                        parse_mode="HTML",
                     )
                     meta["last_reminded_ts"] = now
                     data[key] = meta
@@ -641,10 +647,9 @@ async def watchdog(chat_id: int):
             try:
                 await bot.send_message(
                     chat_id,
-                    "Лобби протухло 🫠\n"
-                    "*5 минут тишины* — закрываю сбор.\n\n"
-                    "Хотите снова — напишите *«Начать игру»* 😏",
-                    parse_mode="Markdown",
+                    "Лобби протухло 🫠\n<b>5 минут тишины</b> — закрываю сбор.\n\n"
+                    "Хотите снова — напишите <b>«Начать игру»</b> 😏",
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
@@ -672,8 +677,8 @@ async def start_round(chat_id: int):
     if len(gs.players) < MIN_PLAYERS:
         await bot.send_message(
             chat_id,
-            "Для игры нужно *минимум двое*.\nВсе разошлись? Я тоже 😏",
-            parse_mode="Markdown",
+            "Для игры нужно <b>минимум двое</b>.\nВсе разошлись? Я тоже 😏",
+            parse_mode="HTML",
         )
         await end_game(chat_id)
         return
@@ -698,24 +703,33 @@ async def start_round(chat_id: int):
 
     q, is_spicy, has_secret = choose_question(gs)
 
-    extras = []
+    # ✅ ВОПРОС: КАПС + ЖИРНЫЙ
+    q_caps = q.upper()
+
+    tags = []
     if has_secret:
-        extras.append("*Только честно* 🤫")
+        tags.append("Только честно 🤫")
     if is_spicy:
-        extras.append("*Отвечайте честно* 😈")
-    extras.append(f"*{ROUND_VOTE_SECONDS} сек* на голосование")
+        tags.append("Отвечайте честно 😈")
+
+    tag_line = ""
+    if tags:
+        tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>"
+
+    timer_line = f"\n\n<i>({ROUND_VOTE_SECONDS} сек на голосование)</i>"
 
     text = (
-        f"*Раунд {gs.round}* 😈\n\n"
-        f"{q}\n\n"
-        f"({', '.join(extras)})\n\n"
-        f"*Голосуйте* 👇"
+        f"<b>РАУНД {gs.round} 😈</b>\n\n"
+        f"<b>{h(q_caps)}</b>"
+        f"{tag_line}"
+        f"{timer_line}\n\n"
+        f"<b>Голосуйте</b> 👇"
     )
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="Markdown")
+    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
@@ -740,9 +754,9 @@ async def round_timer(chat_id: int, seconds: int):
 
         m = await bot.send_message(
             chat_id,
-            msg + f"\n\nДадим ещё *{EXTEND_SECONDS} секунд*?\n*Только ведущий* может продлить 😏",
+            msg + f"\n\nДадим ещё <b>{EXTEND_SECONDS} секунд</b>?\n<b>Только ведущий</b> может продлить 😏",
             reply_markup=kb_not_all_voted(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         gs.extend_prompt_msg_id = m.message_id
         return
@@ -772,22 +786,22 @@ async def show_round_result(chat_id: int):
     if gs.total_votes == 0:
         await bot.send_message(
             chat_id,
-            f"*Итог раунда {gs.round}:*\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
+            f"<b>ИТОГ РАУНДА {gs.round}:</b>\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
             reply_markup=kb_result(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return
 
     items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
-    lines = [f"*Итог раунда {gs.round}:*"]
+    lines = [f"<b>ИТОГ РАУНДА {gs.round}:</b>"]
     for uid, c in items:
         if c <= 0:
             continue
         p = gs.players.get(uid)
         if p:
-            lines.append(f"— *{p.label}*: {c}")
+            lines.append(f"— <b>{h(p.label)}</b>: {c}")
 
-    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="Markdown")
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="HTML")
 
 
 async def end_game(chat_id: int, reason: str = ""):
@@ -800,7 +814,7 @@ async def end_game(chat_id: int, reason: str = ""):
 
     tail = pick(END_VARIANTS)
     text = f"{reason}\n\n{tail}" if reason else tail
-    await bot.send_message(chat_id, text, parse_mode="Markdown")
+    await bot.send_message(chat_id, text, parse_mode="HTML")
 
 
 # =========================
@@ -827,13 +841,13 @@ async def cmd_start(message: Message):
         return
 
     await message.answer(
-        "Я тут 😏\nЧтобы начать — напишите: *Начать игру*\n/help — правила",
-        parse_mode="Markdown",
+        "Я тут 😏\nЧтобы начать — напишите: <b>Начать игру</b>\n/help — правила",
+        parse_mode="HTML",
     )
 
 
 # =========================
-# DM MENUS (callbacks) — EDIT MODE
+# DM MENUS (callbacks) — EDIT MODE (Markdown)
 # =========================
 @dp.callback_query(F.data == "dm_back")
 async def cb_dm_back(cb: CallbackQuery):
@@ -866,18 +880,18 @@ async def cb_dm_donate(cb: CallbackQuery):
 async def cmd_help(message: Message):
     stats_touch_user(message.from_user.id)
     await message.answer(
-        "*Как играем:*\n"
-        "1) В группе: *Начать игру*\n"
-        "2) Все: *Присоединиться*\n"
-        "3) Ведущий: *Погнали*\n"
-        "4) *Вопрос → 15 сек → итог → следующий*\n\n"
-        "*Правила:*\n"
+        "<b>Как играем:</b>\n"
+        "1) В группе: <b>Начать игру</b>\n"
+        "2) Все: <b>Присоединиться</b>\n"
+        "3) Ведущий: <b>Погнали</b>\n"
+        "4) <b>Вопрос → 15 сек → итог → следующий</b>\n\n"
+        "<b>Правила:</b>\n"
         "— За себя нельзя 😈\n"
-        "— Продление: *только ведущий*\n"
-        "— Лобби тухнет через *5 минут*\n"
-        "— Игра закрывается через *10 минут тишины*\n\n"
+        "— Продление: <b>только ведущий</b>\n"
+        "— Лобби тухнет через <b>5 минут</b>\n"
+        "— Игра закрывается через <b>10 минут тишины</b>\n\n"
         "Это между нами 🤫",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -902,12 +916,12 @@ async def start_lobby(message: Message):
     ensure_watchdog(gs)
 
     await message.answer(
-        "*Между нами* 🤫\n\n"
+        "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
         "Собираю игроков.\n"
-        "Жмите *«Присоединиться»*.\n\n"
-        "*Ведущий* — тот, кто начал 😏",
+        "Жмите <b>«Присоединиться»</b>.\n\n"
+        "<b>Ведущий</b> — тот, кто начал 😏",
         reply_markup=kb_group_lobby(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -921,9 +935,9 @@ async def cb_cancel(cb: CallbackQuery):
 
     await cb.answer("Ок")
     try:
-        await cb.message.edit_text("Отмена 😏\n*Интрига остаётся.*", parse_mode="Markdown")
+        await cb.message.edit_text("Отмена 😏\n<b>Интрига остаётся.</b>", parse_mode="HTML")
     except Exception:
-        await cb.message.answer("Отмена 😏\n*Интрига остаётся.*", parse_mode="Markdown")
+        await cb.message.answer("Отмена 😏\n<b>Интрига остаётся.</b>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "join")
@@ -955,14 +969,14 @@ async def cb_join(cb: CallbackQuery):
     await cb.answer("Записал ✅")
 
     try:
-        players_text = "\n".join([f"• {gs.players[i].label}" for i in gs.join_order])
+        players_text = "\n".join([f"• {h(gs.players[i].label)}" for i in gs.join_order])
         await cb.message.edit_text(
-            "*Между нами* 🤫\n\n"
+            "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
             "Собираю игроков.\n"
-            "Жмите *«Присоединиться»*.\n\n"
-            "*В игре:*\n" + (players_text or "Пока никого."),
+            "Жмите <b>«Присоединиться»</b>.\n\n"
+            "<b>В игре:</b>\n" + (players_text or "Пока никого."),
             reply_markup=kb_group_lobby(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     except Exception:
         pass
@@ -978,11 +992,11 @@ async def cb_start(cb: CallbackQuery):
 
     host = get_host(gs)
     if host is not None and cb.from_user.id != host:
-        await cb.answer("Стартует только *ведущий* 😏", show_alert=True)
+        await cb.answer("Стартует только ведущий 😏", show_alert=True)
         return
 
     if len(gs.players) < MIN_PLAYERS:
-        await cb.answer("Нужно минимум *2 игрока*.", show_alert=True)
+        await cb.answer("Нужно минимум 2 игрока.", show_alert=True)
         return
 
     gs.state = State.RUNNING
@@ -1010,7 +1024,7 @@ async def cb_vote(cb: CallbackQuery):
         await cb.answer("Ты не в этом раунде 😏", show_alert=True)
         return
     if voter_id in gs.voted_users:
-        await cb.answer(pick(ALREADY_VOTED_VARIANTS))
+        await cb.answer(pick(ALREADY_VOTED_TOASTS))
         return
 
     try:
@@ -1052,7 +1066,7 @@ async def cb_extend(cb: CallbackQuery):
 
     host = get_host(gs)
     if host is not None and cb.from_user.id != host:
-        await cb.answer("Продлить может только *ведущий* 😏", show_alert=True)
+        await cb.answer("Продлить может только ведущий 😏", show_alert=True)
         return
 
     if gs.awaiting_next:
@@ -1094,7 +1108,7 @@ async def cb_force_result(cb: CallbackQuery):
 
     host = get_host(gs)
     if host is not None and cb.from_user.id != host:
-        await cb.answer("Только *ведущий* может не ждать 😏", show_alert=True)
+        await cb.answer("Только ведущий может не ждать 😏", show_alert=True)
         return
 
     touch(gs)
@@ -1122,7 +1136,7 @@ async def cb_next(cb: CallbackQuery):
         await cb.answer("Сначала итог 😈")
         return
 
-    await cb.answer(pick(NEXT_VARIANTS))
+    await cb.answer(pick(NEXT_TOASTS))
     await start_round(chat_id)
 
 
@@ -1157,11 +1171,11 @@ async def on_my_chat_member(update: ChatMemberUpdated):
         await bot.send_message(
             chat.id,
             "Я тут 😏\n"
-            "Это *«Между нами 🤫»*.\n\n"
+            "Это <b>«Между нами 🤫»</b>.\n\n"
             "Чтобы начать — напишите:\n"
-            "*Начать игру* 😈\n\n"
+            "<b>Начать игру</b> 😈\n\n"
             "/help — правила",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         chats_store_mark_welcome(chat.id)
     except Exception:
@@ -1181,8 +1195,7 @@ async def cmd_suggest(message: Message):
 
     if not suggestion or len(suggestion) < 10:
         await message.answer(
-            "Коротко слишком 😏\nПример:\n*/suggest Кто из вас чаще всего…?*",
-            parse_mode="Markdown",
+            "Коротко слишком 😏\nПример:\n/suggest Кто из вас чаще всего…?",
         )
         return
 
@@ -1201,9 +1214,8 @@ async def cmd_suggest(message: Message):
     stats_inc("suggestions_count", 1)
 
     await message.answer(
-        "Ок 😈 *Записал*.\n"
-        "Если вопрос *годный* — добавим и будем палить вас им 🤫",
-        parse_mode="Markdown",
+        "Ок 😈 <b>Записал</b>.\nЕсли вопрос <b>годный</b> — добавим и будем палить вас им 🤫",
+        parse_mode="HTML",
     )
 
     if ADMIN_IDS:
@@ -1212,10 +1224,10 @@ async def cmd_suggest(message: Message):
             try:
                 await bot.send_message(
                     admin_id,
-                    "💡 *Новый предложенный вопрос:*\n"
-                    f"{preview}\n\n"
-                    f"От: {message.from_user.id} (@{message.from_user.username})",
-                    parse_mode="Markdown",
+                    "💡 <b>Новый предложенный вопрос:</b>\n"
+                    f"{h(preview)}\n\n"
+                    f"От: {message.from_user.id} (@{h(message.from_user.username or '')})",
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
@@ -1233,15 +1245,15 @@ async def cmd_stats(message: Message):
     stats_init()
     s = _read_json(STATS_PATH, {})
     await message.answer(
-        "*📊 Статистика бота:*\n\n"
-        f"👤 *Уник. пользователей:* {s.get('users_unique', 0)}\n"
-        f"💬 *Уник. чатов:* {s.get('chats_unique', 0)}\n"
-        f"🎮 *Игр стартовало:* {s.get('games_started', 0)}\n"
-        f"🌀 *Раундов сыграно:* {s.get('rounds_played', 0)}\n"
-        f"🗳 *Голосов:* {s.get('votes_cast', 0)}\n"
-        f"⭐ *Stars:* {s.get('donations_stars_total', 0)} / {s.get('donations_count', 0)} платежей\n"
-        f"💡 *Предложений вопросов:* {s.get('suggestions_count', 0)}",
-        parse_mode="Markdown",
+        "<b>📊 Статистика бота:</b>\n\n"
+        f"👤 <b>Уник. пользователей:</b> {s.get('users_unique', 0)}\n"
+        f"💬 <b>Уник. чатов:</b> {s.get('chats_unique', 0)}\n"
+        f"🎮 <b>Игр стартовало:</b> {s.get('games_started', 0)}\n"
+        f"🌀 <b>Раундов сыграно:</b> {s.get('rounds_played', 0)}\n"
+        f"🗳 <b>Голосов:</b> {s.get('votes_cast', 0)}\n"
+        f"⭐ <b>Stars:</b> {s.get('donations_stars_total', 0)} / {s.get('donations_count', 0)} платежей\n"
+        f"💡 <b>Предложений вопросов:</b> {s.get('suggestions_count', 0)}",
+        parse_mode="HTML",
     )
 
 
@@ -1298,10 +1310,8 @@ async def successful_payment(message: Message):
     stats_inc("donations_stars_total", stars)
 
     await message.answer(
-        f"*Принято* ⭐ {stars}\n"
-        "Спасибо 😏\n"
-        "Мы это превратим в *ещё более колкие вопросы* 😈",
-        parse_mode="Markdown",
+        f"<b>Принято</b> ⭐ {stars}\nСпасибо 😏\nМы это превратим в <b>ещё более колкие вопросы</b> 😈",
+        parse_mode="HTML",
     )
 
 
