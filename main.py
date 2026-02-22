@@ -113,6 +113,7 @@ SPICY_QUESTIONS = [
     "Кто мог бы утаить правду, чтобы не выглядеть виноватым?",
 ]
 
+# 20 вопросов “Только пацаны”
 BOYS_ONLY_QUESTIONS = [
     "Кто из вас пёрнет и будет до последнего делать вид, что это не он? (выбранный оправдывается как адвокат)",
     "Кто напердит и будет угорать так, будто это стендап? (выбранный объясняет, почему ему это смешно)",
@@ -204,11 +205,11 @@ class GameState:
 
     last_next_press_ts: Dict[int, float] = field(default_factory=dict)
 
-    # lobby identity (anti “старое лобби”)
+    # lobby identity
     lobby_msg_id: Optional[int] = None
     lobby_token: int = 0
 
-    # round identity (anti “старые кнопки/таймеры”)
+    # round identity
     round_msg_id: Optional[int] = None
     round_token: int = 0
 
@@ -552,7 +553,6 @@ def result_comment(question: str, winner_html: str) -> str:
 
 
 def boys_result_comment(question: str, winner_html: str) -> str:
-    # 1:1 (если поменяешь вопрос — обнови ключ здесь)
     m: Dict[str, List[str]] = {
         BOYS_ONLY_QUESTIONS[0]: [
             f"{winner_html} — ну ты крыса. Навонял и молчишь 😏",
@@ -765,7 +765,7 @@ def kb_end_confirm():
 
 
 # =========================
-# LOBBY RENDER / UPDATE (token-safe)
+# LOBBY RENDER / UPDATE
 # =========================
 def lobby_text(gs: GameState) -> str:
     players = [gs.players[uid].label for uid in gs.join_order if uid in gs.players]
@@ -790,7 +790,6 @@ def lobby_text(gs: GameState) -> str:
 async def lobby_upsert(gs: GameState):
     text = lobby_text(gs)
 
-    # пробуем отредактировать текущее лобби
     if gs.lobby_msg_id:
         try:
             await bot.edit_message_text(
@@ -804,14 +803,12 @@ async def lobby_upsert(gs: GameState):
         except Exception:
             pass
 
-    # не смогли отредактировать -> создаём новое, новый token
     old_id = gs.lobby_msg_id
     gs.lobby_token = max(gs.lobby_token + 1, 1)
 
     m = await bot.send_message(gs.chat_id, text, reply_markup=kb_group_lobby(gs), parse_mode="HTML")
     gs.lobby_msg_id = m.message_id
 
-    # убираем старое лобби, чтобы не было двух панелей
     if old_id and old_id != gs.lobby_msg_id:
         try:
             await bot.delete_message(gs.chat_id, old_id)
@@ -833,6 +830,14 @@ async def ensure_lobby_fresh(cb: CallbackQuery, gs: GameState) -> bool:
         await lobby_upsert(gs)
         return False
     return True
+
+
+async def stale_lobby(cb: CallbackQuery):
+    await cb.answer("Это старое меню 😏 Напиши «Начать игру».", show_alert=True)
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
 
 
 # =========================
@@ -926,7 +931,7 @@ async def watchdog(chat_id: int):
             return
 
         if gs.state != State.IDLE and idle_sec >= SESSION_CLOSE_SEC:
-            await end_game(chat_id, reason=pick(INACTIVE_END_VARIANTS))
+            await end_game(chat_id, reason=random.choice(INACTIVE_END_VARIANTS))
             return
 
 
@@ -937,7 +942,7 @@ def ensure_watchdog(gs: GameState):
 
 
 # =========================
-# ROUND FLOW (token-safe)
+# ROUND FLOW
 # =========================
 async def start_round(chat_id: int):
     gs = GAMES.get(chat_id)
@@ -1034,9 +1039,7 @@ async def round_timer(chat_id: int, seconds: int, token: int):
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING or gs.ended:
         return
-    if token != gs.round_token:
-        return
-    if gs.awaiting_next:
+    if token != gs.round_token or gs.awaiting_next:
         return
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
@@ -1046,7 +1049,7 @@ async def round_timer(chat_id: int, seconds: int, token: int):
         touch(gs)
 
         missing = len(gs.round_voters) - len(gs.voted_users)
-        msg = pick(TIMEUP_NO_VOTES) if gs.total_votes == 0 else pick(TIMEUP_MISSING).format(missing=missing)
+        msg = random.choice(TIMEUP_NO_VOTES) if gs.total_votes == 0 else random.choice(TIMEUP_MISSING).format(missing=missing)
 
         m = await bot.send_message(
             chat_id,
@@ -1064,9 +1067,7 @@ async def show_round_result(chat_id: int, token: int):
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING or gs.ended:
         return
-    if token != gs.round_token:
-        return
-    if gs.awaiting_next:
+    if token != gs.round_token or gs.awaiting_next:
         return
 
     gs.awaiting_next = True
@@ -1131,7 +1132,7 @@ async def end_game(chat_id: int, reason: str = ""):
     await cleanup_game(gs)
     GAMES.pop(chat_id, None)
 
-    tail = pick(END_VARIANTS)
+    tail = random.choice(END_VARIANTS)
     text = f"{reason}\n\n{tail}" if reason else tail
     await bot.send_message(chat_id, text, parse_mode="HTML")
 
@@ -1146,7 +1147,7 @@ async def cmd_start(message: Message):
     if message.chat.type == "private":
         text = (
             "Привет 😏\n\n"
-            f"{pick(DM_WELCOME_VARIANTS)}\n\n"
+            f"{random.choice(DM_WELCOME_VARIANTS)}\n\n"
             "*Как запустить:*\n"
             "1) *Добавь меня в группу*\n"
             "2) В группе напиши: *Начать игру*\n\n"
@@ -1237,9 +1238,16 @@ async def start_lobby(message: Message):
 @dp.callback_query(F.data.startswith("mode_all:"))
 async def cb_mode_all(cb: CallbackQuery):
     gs = GAMES.get(cb.message.chat.id)
-    if not gs or gs.ended or gs.state != State.LOBBY:
-        await cb.answer("Поздно менять 😏", show_alert=True)
+
+    # ✅ FIX: после завершения — это старое меню, а не “поздно менять”
+    if not gs or gs.ended:
+        await stale_lobby(cb)
         return
+
+    if gs.state != State.LOBBY:
+        await cb.answer("Режим меняется в лобби 😏", show_alert=True)
+        return
+
     if not await ensure_lobby_fresh(cb, gs):
         return
 
@@ -1248,6 +1256,7 @@ async def cb_mode_all(cb: CallbackQuery):
         return
 
     gs.mode = "all"
+    touch(gs)
     await cb.answer("Ок 🔥 Для всех")
     await lobby_upsert(gs)
 
@@ -1255,9 +1264,16 @@ async def cb_mode_all(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("mode_boys:"))
 async def cb_mode_boys(cb: CallbackQuery):
     gs = GAMES.get(cb.message.chat.id)
-    if not gs or gs.ended or gs.state != State.LOBBY:
-        await cb.answer("Поздно менять 😏", show_alert=True)
+
+    # ✅ FIX: после завершения — это старое меню, а не “поздно менять”
+    if not gs or gs.ended:
+        await stale_lobby(cb)
         return
+
+    if gs.state != State.LOBBY:
+        await cb.answer("Режим меняется в лобби 😏", show_alert=True)
+        return
+
     if not await ensure_lobby_fresh(cb, gs):
         return
 
@@ -1266,6 +1282,7 @@ async def cb_mode_boys(cb: CallbackQuery):
         return
 
     gs.mode = "boys"
+    touch(gs)
     await cb.answer("Ок 😈 Только пацаны")
     await lobby_upsert(gs)
 
@@ -1360,15 +1377,12 @@ async def cb_start(cb: CallbackQuery):
     stats_inc("games_started", 1)
 
     await cb.answer("Погнали 😈")
-
-    # минимизируем “нажатия в прошлое”: убираем клаву лобби
     await safe_clear_markup(chat_id, gs.lobby_msg_id)
-
     await start_round(chat_id)
 
 
 # =========================
-# VOTE / EXTEND / FORCE / NEXT (token-safe)
+# VOTE / EXTEND / FORCE / NEXT
 # =========================
 @dp.callback_query(F.data.startswith("vote:"))
 async def cb_vote(cb: CallbackQuery):
@@ -1378,7 +1392,6 @@ async def cb_vote(cb: CallbackQuery):
         await cb.answer("Игра уже закрыта 😏", show_alert=True)
         return
 
-    # vote:{token}:{uid}
     try:
         _, tok_s, uid_s = (cb.data or "").split(":", 2)
         token = int(tok_s)
@@ -1535,7 +1548,7 @@ async def cb_next(cb: CallbackQuery):
 
 
 # =========================
-# END CONFIRM FLOW (без ломания чужих клав)
+# END CONFIRM FLOW
 # =========================
 @dp.callback_query(F.data == "end_req")
 async def cb_end_req(cb: CallbackQuery):
@@ -1759,7 +1772,7 @@ async def successful_payment(message: Message):
 
 
 # =========================
-# REMINDER / WATCHDOG STARTUP
+# MAIN
 # =========================
 async def main():
     global BOT_USERNAME
