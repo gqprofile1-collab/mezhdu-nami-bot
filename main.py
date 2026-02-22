@@ -153,7 +153,6 @@ class GameState:
     used_normal: Set[int] = field(default_factory=set)
     used_spicy: Set[int] = field(default_factory=set)
 
-    # spicy каждые 3–4, secret вставка каждые 4–5
     since_last_spicy: int = 0
     next_spicy_at: int = field(default_factory=lambda: random.randint(3, 4))
     since_last_secret: int = 0
@@ -166,12 +165,12 @@ class GameState:
     voted_users: Set[int] = field(default_factory=set)
     total_votes: int = 0
 
-    # таймер-логика продления
-    extended_prompted: bool = False  # уже показали меню "продлить?"
-    extend_used: bool = False        # уже продляли 1 раз
-    extend_prompt_msg_id: Optional[int] = None  # id сообщения "продлить?"
+    extended_prompted: bool = False
+    extend_used: bool = False
+    extend_prompt_msg_id: Optional[int] = None
 
     awaiting_next: bool = False
+    ended: bool = False  # <-- важный флаг против "дописал после завершения"
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
     watchdog_task: Optional[asyncio.Task] = None
@@ -179,20 +178,20 @@ class GameState:
 
     last_next_press_ts: Dict[int, float] = field(default_factory=dict)
 
+    # <-- чтобы не было “двух лобби” и рассинхрона
+    lobby_msg_id: Optional[int] = None
+
 
 GAMES: Dict[int, GameState] = {}
 
 
 # =========================
-# HTML helper
+# helpers
 # =========================
 def h(text: str) -> str:
     return html.escape(text or "")
 
 
-# =========================
-# JSON helpers
-# =========================
 def _read_json(path: Path, default):
     try:
         if not path.exists():
@@ -206,9 +205,6 @@ def _write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# =========================
-# STATS
-# =========================
 def stats_init():
     if STATS_PATH.exists():
         return
@@ -259,9 +255,6 @@ def stats_inc(key: str, n: int = 1):
     _write_json(STATS_PATH, s)
 
 
-# =========================
-# CHATS STORE (reminders + group welcome once)
-# =========================
 def chats_store_mark_game_started(chat_id: int) -> None:
     data = _read_json(CHATS_STORE_PATH, {})
     key = str(chat_id)
@@ -288,219 +281,10 @@ def chats_store_mark_welcome(chat_id: int) -> None:
     _write_json(CHATS_STORE_PATH, data)
 
 
-# =========================
-# STYLE
-# =========================
 def pick(arr: List[str]) -> str:
     return random.choice(arr)
 
 
-DM_WELCOME_VARIANTS = [
-    "Этот бот поможет вам *не заскучать*, задавая *колкие вопросы*.\nНадеюсь, вы *не поругаетесь* во время игры 😈",
-    "Я тут, чтобы компания *не тухла*.\nВопросы — *острые*. Итоги — *неловкие*.\nНе подеритесь там 😏",
-    "Если в чате стало *слишком тихо* — я это исправлю.\nГлавное: *не обижайтесь*. Почти 🤫",
-    "Я добавляю *жару* в любой чат.\n*Колкие вопросы* + *быстрые голосования*.\nНадеюсь, вы выживете 😈",
-    "Мини-реалити в вашем чате:\n*вопрос → голосование → итог*.\nДа, будет неловко 😏",
-]
-
-# ВАЖНО: это используется в cb.answer (toast) => НИКАКОГО Markdown/HTML
-ALREADY_VOTED_TOASTS = [
-    "Всё, выбор сделан 😏",
-    "Один голос — и живи с этим 🤫",
-    "Поздно переобуваться 😈",
-    "Голос уже улетел. Не догоняй 😏",
-    "Второй попытки не будет 😈",
-    "Без переигровок. Я строгий 😏",
-    "Ты уже отметился 😈",
-    "Назад дороги нет 🤫",
-    "Переобувка запрещена 😏",
-    "Голос засчитан. Терпи 😈",
-]
-
-NEXT_TOASTS = [
-    "Дальше 😈",
-    "Поехали 😏",
-    "Газуем 🤫",
-    "Следующий. Держитесь 😈",
-    "Продолжаем 😏",
-    "Ещё раунд — легко 😈",
-    "Погнали 😏",
-    "Не тормозим 🤫",
-    "Ок, следующий 😈",
-    "Вперёд 😏",
-]
-
-END_VARIANTS = [
-    "Было <b>опасно приятно</b> 😈 Возвращайтесь.",
-    "Ну всё, красавчики. Захотите ещё — <b>зовите</b> 😏",
-    "Игра окончена. <b>Обиды не хранить</b>. Почти 🤫",
-    "Разошлись красиво. Но я всё <b>запомнил</b> 😈",
-    "Спасибо за игру. В следующий раз будет <b>ещё больнее</b> 😏",
-    "Конец. И да — это <b>между нами</b> 🤫",
-    "Пауза на жизнь. Потом продолжим 😈",
-    "Вы держались достойно. <b>Почти</b> 😏",
-    "Игра закрыта. Кто обиделся — тот проиграл 🤫",
-    "До встречи. Я рядом, когда станет скучно 😈",
-]
-
-INACTIVE_END_VARIANTS = [
-    "<b>10 минут тишины</b>… я понял 🫠\nЗакрываю игру. Вернётесь — продолжим 😈",
-    "Чат ушёл в спячку 😴\nЗакрываю сессию. Но я рядом 😏",
-    "Тишина слишком громкая 🤫\nЗакрываю игру.",
-    "Пауза затянулась.\nЗакрываю 😈",
-    "Я подождал. Хватит 🤫\nЗакрываю.",
-]
-
-TIMEUP_NO_VOTES = [
-    "<b>Время вышло</b> ⏰\nИ… никто не рискнул 😏",
-    "<b>Ноль голосов</b>.\nСлишком мило. Подозрительно 🤨",
-    "Тишина.\n<b>Боитесь последствий?</b> 😈",
-    "Никто не нажал.\nНу вы и осторожные 🤫",
-    "Ноль.\nЯ даже разочарован 😏",
-]
-
-TIMEUP_MISSING = [
-    "<b>Время вышло</b> ⏰\nЕщё <b>{missing}</b> молчат…",
-    "<b>{missing}</b> всё ещё “думают” 😏",
-    "Ещё <b>{missing}</b> без голоса.\nТянете драму 🤫",
-    "Жду <b>{missing}</b>.\nНо недолго 😈",
-    "Ещё <b>{missing}</b> — и считаем как есть 😏",
-]
-
-
-# =========================
-# DM MENU TEXTS (Markdown)
-# =========================
-def dm_home_text() -> str:
-    return (
-        "Меню 😏\n\n"
-        "— *Добавь меня в группу* и запусти *«Начать игру»*\n"
-        "— Предложи свой вопрос (если он злой — я его люблю)\n"
-        "— Поддержи проект Stars ⭐\n\n"
-        "*Выбирай* 👇"
-    )
-
-
-def dm_howto_text() -> str:
-    return (
-        "*Как играть* 📌\n\n"
-        "1) *Добавь меня в группу*\n"
-        "2) В группе: *Начать игру*\n"
-        "3) Все жмут: *Присоединиться*\n"
-        "4) Ведущий жмёт: *Погнали*\n\n"
-        "Дальше: *вопрос → голосование → итог*.\n"
-        "*За себя голосовать нельзя* 😈"
-    )
-
-
-def dm_suggest_text() -> str:
-    return (
-        "*Предложить вопрос* 💡\n\n"
-        "Напиши командой:\n"
-        "* /suggest Кто из вас…? *\n\n"
-        "Я всё соберу.\n"
-        "Если вопрос *годный и колкий* — добавим в игру 😈"
-    )
-
-
-def dm_donate_text() -> str:
-    return (
-        "*Поддержать проект Stars* ⭐\n\n"
-        "Донат прилетает *боту (Stars)* и идёт в развитие.\n"
-        "Мы это превратим в *ещё более колкие вопросы* 😈\n\n"
-        "*Выбирай сумму* 👇"
-    )
-
-
-# =========================
-# DM MENU EDIT HELPER (Markdown)
-# =========================
-async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
-    try:
-        await cb.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            return
-        await bot.send_message(cb.from_user.id, text, reply_markup=markup, parse_mode="Markdown")
-
-
-# =========================
-# KEYBOARDS
-# =========================
-def kb_dm_home():
-    b = InlineKeyboardBuilder()
-    if BOT_USERNAME:
-        b.button(text="➕ Добавить в группу", url=f"https://t.me/{BOT_USERNAME}?startgroup=1")
-    b.button(text="📌 Как играть", callback_data="dm_howto")
-    b.button(text="💡 Предложить вопрос", callback_data="dm_suggest")
-    b.button(text="⭐ Поддержать Stars", callback_data="dm_donate")
-    b.adjust(1, 1, 1, 1)
-    return b.as_markup()
-
-
-def kb_dm_back():
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Назад", callback_data="dm_back")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def kb_dm_donate_amounts():
-    b = InlineKeyboardBuilder()
-    for amt in [10, 25, 50, 100, 250, 500, 1000]:
-        b.button(text=f"⭐ {amt}", callback_data=f"donate:{amt}")
-    b.button(text="⬅️ Назад", callback_data="dm_back")
-    b.adjust(3, 2, 2, 1)
-    return b.as_markup()
-
-
-def kb_group_lobby():
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Присоединиться", callback_data="join")
-    b.button(text="🔥 Ну что? Погнали?", callback_data="start")
-    b.button(text="❌ Отмена", callback_data="cancel")
-    b.adjust(1, 1, 1)
-    return b.as_markup()
-
-
-def kb_vote(gs: GameState):
-    b = InlineKeyboardBuilder()
-    targets = [(uid, gs.players[uid]) for uid in gs.round_targets if uid in gs.players]
-    targets.sort(key=lambda x: x[1].label.lower())
-
-    for uid, p in targets:
-        b.button(text=p.label, callback_data=f"vote:{uid}")
-
-    cols = 2 if len(targets) <= 6 else 3
-    if targets:
-        b.adjust(*([cols] * ((len(targets) + cols - 1) // cols)))
-
-    b.row()
-    b.button(text="🛑 Завершить", callback_data="end")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def kb_result():
-    b = InlineKeyboardBuilder()
-    b.button(text="👉 Следующий вопросик", callback_data="next")
-    b.button(text="🛑 Завершить", callback_data="end")
-    b.adjust(1, 1)
-    return b.as_markup()
-
-
-def kb_not_all_voted():
-    b = InlineKeyboardBuilder()
-    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")
-    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")
-    b.button(text="🛑 Завершить", callback_data="end")
-    b.adjust(1, 1, 1)
-    return b.as_markup()
-
-
-# =========================
-# GAME HELPERS
-# =========================
 def touch(gs: GameState):
     gs.last_activity = datetime.utcnow()
 
@@ -569,7 +353,307 @@ def get_host(gs: GameState) -> Optional[int]:
     return None
 
 
+# =========================
+# STYLE / TEXTS
+# =========================
+DM_WELCOME_VARIANTS = [
+    "Этот бот поможет вам *не заскучать*, задавая *колкие вопросы*.\nНадеюсь, вы *не поругаетесь* во время игры 😈",
+    "Я тут, чтобы компания *не тухла*.\nВопросы — *острые*. Итоги — *неловкие*.\nНе подеритесь там 😏",
+    "Если в чате стало *слишком тихо* — я это исправлю.\nГлавное: *не обижайтесь*. Почти 🤫",
+    "Я добавляю *жару* в любой чат.\n*Колкие вопросы* + *быстрые голосования*.\nНадеюсь, вы выживете 😈",
+    "Мини-реалити в вашем чате:\n*вопрос → голосование → итог*.\nДа, будет неловко 😏",
+]
+
+# toast: только plain text (Telegram не форматирует)
+ALREADY_VOTED_TOASTS = [
+    "Всё, выбор сделан 😏",
+    "Один голос — и живи с этим 🤫",
+    "Поздно переобуваться 😈",
+    "Голос уже улетел. Не догоняй 😏",
+    "Второй попытки не будет 😈",
+    "Без переигровок. Я строгий 😏",
+    "Ты уже отметился 😈",
+    "Назад дороги нет 🤫",
+    "Переобувка запрещена 😏",
+    "Голос засчитан. Терпи 😈",
+]
+
+NEXT_TOASTS = ["Дальше 😈", "Поехали 😏", "Газуем 🤫", "Следующий. Держитесь 😈", "Продолжаем 😏"]
+
+END_VARIANTS = [
+    "Было <b>опасно приятно</b> 😈 Возвращайтесь.",
+    "Ну всё. Захотите ещё — <b>зовите</b> 😏",
+    "Игра окончена. <b>Обиды не хранить</b>. Почти 🤫",
+    "Разошлись красиво. Но я всё <b>запомнил</b> 😈",
+    "Конец. И да — это <b>между нами</b> 🤫",
+]
+
+INACTIVE_END_VARIANTS = [
+    "<b>10 минут тишины</b>… я понял 🫠\nЗакрываю игру. Вернётесь — продолжим 😈",
+    "Чат ушёл в спячку 😴\nЗакрываю сессию. Но я рядом 😏",
+    "Пауза затянулась.\nЗакрываю 😈",
+]
+
+TIMEUP_NO_VOTES = [
+    "<b>Время вышло</b> ⏰\nИ… никто не рискнул 😏",
+    "<b>Ноль голосов</b>.\nСлишком мило. Подозрительно 🤨",
+    "Тишина.\n<b>Боитесь последствий?</b> 😈",
+]
+
+TIMEUP_MISSING = [
+    "<b>Время вышло</b> ⏰\nЕщё <b>{missing}</b> молчат…",
+    "Ещё <b>{missing}</b> без голоса.\nТянете драму 🤫",
+    "Жду <b>{missing}</b>.\nНо недолго 😈",
+]
+
+
+def dm_home_text() -> str:
+    return (
+        "Меню 😏\n\n"
+        "— *Добавь меня в группу* и запусти *«Начать игру»*\n"
+        "— Предложи свой вопрос (если он злой — я его люблю)\n"
+        "— Поддержи проект Stars ⭐\n\n"
+        "*Выбирай* 👇"
+    )
+
+
+def dm_howto_text() -> str:
+    return (
+        "*Как играть* 📌\n\n"
+        "1) *Добавь меня в группу*\n"
+        "2) В группе: *Начать игру*\n"
+        "3) Все жмут: *Присоединиться*\n"
+        "4) Ведущий жмёт: *Погнали*\n\n"
+        "Дальше: *вопрос → голосование → итог*.\n"
+        "*За себя голосовать нельзя* 😈"
+    )
+
+
+def dm_suggest_text() -> str:
+    return (
+        "*Предложить вопрос* 💡\n\n"
+        "Напиши командой:\n"
+        "* /suggest Кто из вас…? *\n\n"
+        "Я всё соберу.\n"
+        "Если вопрос *годный и колкий* — добавим в игру 😈"
+    )
+
+
+def dm_donate_text() -> str:
+    return (
+        "*Поддержать проект Stars* ⭐\n\n"
+        "Донат прилетает *боту (Stars)* и идёт в развитие.\n"
+        "Мы это превратим в *ещё более колкие вопросы* 😈\n\n"
+        "*Выбирай сумму* 👇"
+    )
+
+
+async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
+    try:
+        await cb.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        await bot.send_message(cb.from_user.id, text, reply_markup=markup, parse_mode="Markdown")
+
+
+# =========================
+# RESULT COMMENTS (3 variants per matched question)
+# =========================
+def result_comment(question: str, winner_label: str) -> str:
+    q = (question or "").lower()
+
+    # 3 варианта под конкретные вопросы (по ключевым словам)
+    rules: List[Tuple[List[str], List[str]]] = [
+        (["мастер отмазок", "отмаз"], [
+            f"{winner_label} — тебя выбрали! Как теперь <b>отмазываться</b> будешь? 😂",
+            f"{winner_label} победил(а) в номинации <b>«отмаз года»</b>. Покажи класс 😏",
+            f"{winner_label}, у нас тут <b>профессионал</b>. Дай пару уроков 🤫",
+        ]),
+        (["молчать", "молчание"], [
+            f"{winner_label} — ты что, <b>«Молчание ягнят»</b> пересмотрел(а)? 😈",
+            f"{winner_label}: наказание тишиной — это <b>твой язык любви</b>? 🤫",
+            f"{winner_label} молчит так, что у людей <b>совесть просыпается</b> 😏",
+        ]),
+        (["игнор"], [
+            f"{winner_label} — чемпион по <b>игнору</b>. Связь пропала, абонент токсичен 😏",
+            f"{winner_label}: «прочитал(а) и исчез(ла)» — <b>классика жанра</b> 🤫",
+            f"{winner_label} в игноре так уверенно, будто это <b>спорт</b> 😈",
+        ]),
+        (["опаздыва", "опоздал"], [
+            f"{winner_label} — ты опять <b>в пути</b>? Уже третий год 😏",
+            f"{winner_label}: опоздание — это <b>стиль жизни</b> 🤫",
+            f"{winner_label} приходит позже всех, зато с <b>эффектом</b> 😈",
+        ]),
+        (["ревнив"], [
+            f"{winner_label} — ну всё, <b>проверка сторис</b> началась 😏",
+            f"{winner_label}: ревнует так тихо, что слышно <b>всем</b> 🤫",
+            f"{winner_label} — главный(ая) по <b>контролю</b>. Пальцы в чат 😈",
+        ]),
+        (["врет", "врёт", "врать"], [
+            f"{winner_label} — мелкая ложь? Да это <b>фирменный стиль</b> 😏",
+            f"{winner_label}: «я? никогда» — звучит как <b>улика</b> 🤫",
+            f"{winner_label} врёт так мило, что люди ещё и <b>верят</b> 😈",
+        ]),
+        (["хитрый", "переговорщик", "продав"], [
+            f"{winner_label} — переговоры с тобой это <b>минус 2 нерва</b> 😏",
+            f"{winner_label} продавил(а) бы решение даже <b>улыбкой</b> 🤫",
+            f"{winner_label} — хитрость на максималках. <b>Опасно</b> 😈",
+        ]),
+        (["токсич"], [
+            f"{winner_label} — устал(а) и стал(а) <b>токсик-режим</b> 😈",
+            f"{winner_label}: «я норм» — звучит как <b>угроза</b> 😏",
+            f"{winner_label} токсичит так, что хочется <b>извиниться</b> без причины 🤫",
+        ]),
+        (["серый кардинал"], [
+            f"{winner_label} — главный(ая) <b>серый кардинал</b>. Мы всё поняли 😏",
+            f"{winner_label} рулит так тихо, что люди думают это их <b>идея</b> 🤫",
+            f"{winner_label}: влияние — <b>незаметное</b>, результат — жесткий 😈",
+        ]),
+        (["внимание"], [
+            f"{winner_label} — центр внимания по умолчанию. <b>Привычно</b> 😏",
+            f"{winner_label}: без аплодисментов день не считается? 🤫",
+            f"{winner_label} любит внимание так, что оно само <b>приходит</b> 😈",
+        ]),
+    ]
+
+    for keys, variants in rules:
+        if any(k in q for k in keys):
+            return pick(variants)
+
+    # дефолт — 3 варианта
+    generic = [
+        f"{winner_label} — тебя выбрали. <b>Узнаёшь себя?</b> 😏",
+        f"{winner_label}, поздравляю: ты сегодня <b>в центре сюжета</b> 😈",
+        f"{winner_label} — большинством голосов. <b>Комментарий будет?</b> 🤫",
+    ]
+    return pick(generic)
+
+
+# =========================
+# KEYBOARDS
+# =========================
+def kb_dm_home():
+    b = InlineKeyboardBuilder()
+    if BOT_USERNAME:
+        b.button(text="➕ Добавить в группу", url=f"https://t.me/{BOT_USERNAME}?startgroup=1")
+    b.button(text="📌 Как играть", callback_data="dm_howto")
+    b.button(text="💡 Предложить вопрос", callback_data="dm_suggest")
+    b.button(text="⭐ Поддержать Stars", callback_data="dm_donate")
+    b.adjust(1, 1, 1, 1)
+    return b.as_markup()
+
+
+def kb_dm_back():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="dm_back")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_dm_donate_amounts():
+    b = InlineKeyboardBuilder()
+    for amt in [10, 25, 50, 100, 250, 500, 1000]:
+        b.button(text=f"⭐ {amt}", callback_data=f"donate:{amt}")
+    b.button(text="⬅️ Назад", callback_data="dm_back")
+    b.adjust(3, 2, 2, 1)
+    return b.as_markup()
+
+
+def kb_group_lobby():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Присоединиться", callback_data="join")
+    b.button(text="🔥 Ну что? Погнали?", callback_data="start")
+    b.button(text="Отмена", callback_data="cancel")
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
+
+def kb_vote(gs: GameState):
+    b = InlineKeyboardBuilder()
+    targets = [(uid, gs.players[uid]) for uid in gs.round_targets if uid in gs.players]
+    targets.sort(key=lambda x: x[1].label.lower())
+    for uid, p in targets:
+        b.button(text=p.label, callback_data=f"vote:{uid}")
+
+    cols = 2 if len(targets) <= 6 else 3
+    if targets:
+        b.adjust(*([cols] * ((len(targets) + cols - 1) // cols)))
+
+    b.row()
+    b.button(text="Завершить игру", callback_data="end_req")  # <-- спокойнее
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_result():
+    b = InlineKeyboardBuilder()
+    b.button(text="👉 Следующий вопросик", callback_data="next")
+    b.button(text="Завершить игру", callback_data="end_req")
+    b.adjust(1, 1)
+    return b.as_markup()
+
+
+def kb_not_all_voted():
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")
+    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")
+    b.button(text="Завершить игру", callback_data="end_req")
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
+
+def kb_end_confirm():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, завершить", callback_data="end_yes")
+    b.button(text="⬅️ Нет", callback_data="end_no")
+    b.adjust(1, 1)
+    return b.as_markup()
+
+
+# =========================
+# LOBBY RENDER / UPDATE
+# =========================
+def lobby_text(gs: GameState) -> str:
+    players = [gs.players[uid].label for uid in gs.join_order if uid in gs.players]
+    lines = "\n".join([f"• {h(x)}" for x in players]) if players else "Пока никого."
+    return (
+        "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
+        "Собираю игроков.\n"
+        "Жмите <b>«Присоединиться»</b>.\n\n"
+        f"<b>В игре:</b>\n{lines}\n\n"
+        "<b>Ведущий</b> — тот, кто начал 😏"
+    )
+
+
+async def lobby_upsert(gs: GameState):
+    """
+    Всегда поддерживаем ОДНО актуальное сообщение лобби.
+    Если редактирование не удалось — создаём новое и запоминаем id.
+    """
+    text = lobby_text(gs)
+    try:
+        if gs.lobby_msg_id:
+            await bot.edit_message_text(
+                chat_id=gs.chat_id,
+                message_id=gs.lobby_msg_id,
+                text=text,
+                reply_markup=kb_group_lobby(),
+                parse_mode="HTML",
+            )
+            return
+    except Exception:
+        pass
+
+    m = await bot.send_message(gs.chat_id, text, reply_markup=kb_group_lobby(), parse_mode="HTML")
+    gs.lobby_msg_id = m.message_id
+
+
+# =========================
+# CLEANUP / WATCHDOG / REMINDER
+# =========================
 async def cleanup_game(gs: GameState):
+    gs.ended = True
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
     if gs.watchdog_task and not gs.watchdog_task.done():
@@ -582,9 +666,6 @@ async def cleanup_game(gs: GameState):
         gs.extend_prompt_msg_id = None
 
 
-# =========================
-# REMINDER LOOP
-# =========================
 async def reminder_loop():
     while True:
         try:
@@ -600,7 +681,6 @@ async def reminder_loop():
 
                 last_started = int(meta.get("last_started_ts", 0))
                 last_reminded = int(meta.get("last_reminded_ts", 0))
-
                 if last_started <= 0:
                     continue
                 if now - last_started < REMIND_EVERY_SEC:
@@ -629,14 +709,13 @@ async def reminder_loop():
             continue
 
 
-# =========================
-# WATCHDOG
-# =========================
 async def watchdog(chat_id: int):
     while True:
         await asyncio.sleep(10)
         gs = GAMES.get(chat_id)
         if not gs:
+            return
+        if gs.ended:
             return
 
         idle_sec = (datetime.utcnow() - gs.last_activity).total_seconds()
@@ -671,7 +750,7 @@ def ensure_watchdog(gs: GameState):
 # =========================
 async def start_round(chat_id: int):
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         return
 
     if len(gs.players) < MIN_PLAYERS:
@@ -688,7 +767,12 @@ async def start_round(chat_id: int):
     gs.awaiting_next = False
     gs.extended_prompted = False
     gs.extend_used = False
-    gs.extend_prompt_msg_id = None
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
 
     gs.round += 1
     stats_inc("rounds_played", 1)
@@ -703,7 +787,6 @@ async def start_round(chat_id: int):
 
     q, is_spicy, has_secret = choose_question(gs)
 
-    # ✅ ВОПРОС: КАПС + ЖИРНЫЙ
     q_caps = q.upper()
 
     tags = []
@@ -712,10 +795,7 @@ async def start_round(chat_id: int):
     if is_spicy:
         tags.append("Отвечайте честно 😈")
 
-    tag_line = ""
-    if tags:
-        tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>"
-
+    tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>" if tags else ""
     timer_line = f"\n\n<i>({ROUND_VOTE_SECONDS} сек на голосование)</i>"
 
     text = (
@@ -740,7 +820,7 @@ async def round_timer(chat_id: int, seconds: int):
         return
 
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.awaiting_next:
+    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
         return
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
@@ -766,7 +846,7 @@ async def round_timer(chat_id: int, seconds: int):
 
 async def show_round_result(chat_id: int):
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.awaiting_next:
+    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
         return
 
     touch(gs)
@@ -775,7 +855,7 @@ async def show_round_result(chat_id: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    # убираем “продлить?” если висит
+    # убираем “продлить?”
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
@@ -793,6 +873,9 @@ async def show_round_result(chat_id: int):
         return
 
     items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
+    top_uid, top_count = items[0]
+    top_all = [uid for uid, c in items if c == top_count]
+
     lines = [f"<b>ИТОГ РАУНДА {gs.round}:</b>"]
     for uid, c in items:
         if c <= 0:
@@ -801,7 +884,22 @@ async def show_round_result(chat_id: int):
         if p:
             lines.append(f"— <b>{h(p.label)}</b>: {c}")
 
+    lines.append("")  # пустая строка
+
+    if len(top_all) == 1 and top_uid in gs.players:
+        winner = gs.players[top_uid].label
+        # комментарий “под вопрос”
+        # (последний вопрос в тексте не хранится отдельно — поэтому берём по верхнему совпадению из pool:
+        # проще: хранить текущий вопрос в gs? не делали — добавим минимально: вопрос можно достать из last message нельзя.
+        # Поэтому сохраняем вопрос в gs локально:
+        pass  # заменим ниже (см. патч: gs_current_question)
+
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="HTML")
+
+
+# --- Патч: храним текущий вопрос, чтобы комментарий был “под него” ---
+# Добавляем поле динамически безопасно (Python позволяет), но лучше сделать явно.
+# Сделаем явно через setattr в start_round (ниже).
 
 
 async def end_game(chat_id: int, reason: str = ""):
@@ -818,7 +916,7 @@ async def end_game(chat_id: int, reason: str = ""):
 
 
 # =========================
-# PRIVATE /start
+# DM
 # =========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -846,9 +944,6 @@ async def cmd_start(message: Message):
     )
 
 
-# =========================
-# DM MENUS (callbacks) — EDIT MODE (Markdown)
-# =========================
 @dp.callback_query(F.data == "dm_back")
 async def cb_dm_back(cb: CallbackQuery):
     await cb.answer()
@@ -874,7 +969,7 @@ async def cb_dm_donate(cb: CallbackQuery):
 
 
 # =========================
-# /help
+# HELP
 # =========================
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -896,7 +991,7 @@ async def cmd_help(message: Message):
 
 
 # =========================
-# GROUP: “Начать игру”
+# GROUP FLOW
 # =========================
 @dp.message(F.text.casefold() == "начать игру")
 async def start_lobby(message: Message):
@@ -905,8 +1000,7 @@ async def start_lobby(message: Message):
 
     chat_id = message.chat.id
     gs = GAMES.get(chat_id)
-
-    if gs and gs.state in {State.LOBBY, State.RUNNING}:
+    if gs and gs.state in {State.LOBBY, State.RUNNING} and not gs.ended:
         await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.")
         return
 
@@ -915,14 +1009,7 @@ async def start_lobby(message: Message):
     touch(gs)
     ensure_watchdog(gs)
 
-    await message.answer(
-        "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
-        "Собираю игроков.\n"
-        "Жмите <b>«Присоединиться»</b>.\n\n"
-        "<b>Ведущий</b> — тот, кто начал 😏",
-        reply_markup=kb_group_lobby(),
-        parse_mode="HTML",
-    )
+    await lobby_upsert(gs)
 
 
 @dp.callback_query(F.data == "cancel")
@@ -944,7 +1031,7 @@ async def cb_cancel(cb: CallbackQuery):
 async def cb_join(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.LOBBY:
+    if not gs or gs.state != State.LOBBY or gs.ended:
         await cb.answer("Лобби закрыто. Напиши «Начать игру».", show_alert=True)
         return
 
@@ -956,8 +1043,11 @@ async def cb_join(cb: CallbackQuery):
 
     uid = cb.from_user.id
     if uid in gs.players:
+        # важно: список мог не обновиться визуально -> мы его обновим принудительно
         await cb.answer("Ты уже в игре 😏")
+        await lobby_upsert(gs)
         return
+
     if len(gs.players) >= MAX_PLAYERS:
         await cb.answer("Уже 10 игроков. Можешь только смотреть 😈", show_alert=True)
         return
@@ -967,26 +1057,14 @@ async def cb_join(cb: CallbackQuery):
     gs.join_order.append(uid)
 
     await cb.answer("Записал ✅")
-
-    try:
-        players_text = "\n".join([f"• {h(gs.players[i].label)}" for i in gs.join_order])
-        await cb.message.edit_text(
-            "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
-            "Собираю игроков.\n"
-            "Жмите <b>«Присоединиться»</b>.\n\n"
-            "<b>В игре:</b>\n" + (players_text or "Пока никого."),
-            reply_markup=kb_group_lobby(),
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    await lobby_upsert(gs)
 
 
 @dp.callback_query(F.data == "start")
 async def cb_start(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.LOBBY:
+    if not gs or gs.state != State.LOBBY or gs.ended:
         await cb.answer("Лобби закрыто. Напиши «Начать игру».", show_alert=True)
         return
 
@@ -1013,7 +1091,7 @@ async def cb_start(cb: CallbackQuery):
 async def cb_vote(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         await cb.answer("Игра не запущена.")
         return
 
@@ -1060,7 +1138,7 @@ async def cb_vote(cb: CallbackQuery):
 async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         await cb.answer("Неактуально.")
         return
 
@@ -1102,7 +1180,7 @@ async def cb_extend(cb: CallbackQuery):
 async def cb_force_result(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         await cb.answer("Неактуально.")
         return
 
@@ -1124,7 +1202,7 @@ async def cb_force_result(cb: CallbackQuery):
 async def cb_next(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         await cb.answer("Игра не запущена.")
         return
 
@@ -1140,14 +1218,51 @@ async def cb_next(cb: CallbackQuery):
     await start_round(chat_id)
 
 
-@dp.callback_query(F.data == "end")
-async def cb_end(cb: CallbackQuery):
-    await cb.answer("Ок")
+# =========================
+# END CONFIRM FLOW
+# =========================
+@dp.callback_query(F.data == "end_req")
+async def cb_end_req(cb: CallbackQuery):
+    gs = GAMES.get(cb.message.chat.id)
+    if not gs or gs.ended:
+        await cb.answer("Ок.")
+        return
+
+    await cb.answer("Точно? 😏")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=kb_end_confirm())
+    except Exception:
+        # если нельзя редактировать — шлём отдельное подтверждение
+        await bot.send_message(
+            cb.message.chat.id,
+            "Точно <b>завершить игру</b>?",
+            reply_markup=kb_end_confirm(),
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data == "end_no")
+async def cb_end_no(cb: CallbackQuery):
+    await cb.answer("Ок 😏")
+    gs = GAMES.get(cb.message.chat.id)
+    if not gs or gs.ended:
+        return
+    # возвращаем нормальную клаву в зависимости от контекста:
+    # проще: вернуть "результатную", она подходит везде
+    try:
+        await cb.message.edit_reply_markup(reply_markup=kb_result())
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "end_yes")
+async def cb_end_yes(cb: CallbackQuery):
+    await cb.answer("Ладно.")
     await end_game(cb.message.chat.id)
 
 
 # =========================
-# Group welcome only once when BOT added
+# BOT ADDED TO GROUP (once)
 # =========================
 @dp.my_chat_member()
 async def on_my_chat_member(update: ChatMemberUpdated):
@@ -1157,13 +1272,11 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 
     old_status = update.old_chat_member.status
     new_status = update.new_chat_member.status
-
     added = old_status in ("left", "kicked") and new_status in ("member", "administrator")
     if not added:
         return
 
     stats_touch_chat(chat.id)
-
     if chats_store_welcome_sent(chat.id):
         return
 
@@ -1183,7 +1296,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 
 
 # =========================
-# Suggestions: /suggest
+# SUGGESTIONS
 # =========================
 @dp.message(Command("suggest"))
 async def cmd_suggest(message: Message):
@@ -1194,9 +1307,7 @@ async def cmd_suggest(message: Message):
     suggestion = parts[1].strip() if len(parts) > 1 else ""
 
     if not suggestion or len(suggestion) < 10:
-        await message.answer(
-            "Коротко слишком 😏\nПример:\n/suggest Кто из вас чаще всего…?",
-        )
+        await message.answer("Коротко слишком 😏\nПример:\n/suggest Кто из вас чаще всего…?")
         return
 
     data = _read_json(SUGGESTIONS_PATH, [])
@@ -1234,7 +1345,7 @@ async def cmd_suggest(message: Message):
 
 
 # =========================
-# Stats: /stats (admins only)
+# STATS (admin)
 # =========================
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -1245,20 +1356,20 @@ async def cmd_stats(message: Message):
     stats_init()
     s = _read_json(STATS_PATH, {})
     await message.answer(
-        "<b>📊 Статистика бота:</b>\n\n"
+        "<b>📊 Статистика:</b>\n\n"
         f"👤 <b>Уник. пользователей:</b> {s.get('users_unique', 0)}\n"
         f"💬 <b>Уник. чатов:</b> {s.get('chats_unique', 0)}\n"
         f"🎮 <b>Игр стартовало:</b> {s.get('games_started', 0)}\n"
         f"🌀 <b>Раундов сыграно:</b> {s.get('rounds_played', 0)}\n"
         f"🗳 <b>Голосов:</b> {s.get('votes_cast', 0)}\n"
         f"⭐ <b>Stars:</b> {s.get('donations_stars_total', 0)} / {s.get('donations_count', 0)} платежей\n"
-        f"💡 <b>Предложений вопросов:</b> {s.get('suggestions_count', 0)}",
+        f"💡 <b>Предложений:</b> {s.get('suggestions_count', 0)}",
         parse_mode="HTML",
     )
 
 
 # =========================
-# Donations: /donate + Stars invoices
+# DONATE (Stars)
 # =========================
 @dp.message(Command("donate"))
 async def cmd_donate(message: Message):
@@ -1284,7 +1395,6 @@ async def cb_donate(cb: CallbackQuery):
         return
 
     prices = [LabeledPrice(label="Донат на развитие", amount=amount)]
-
     await bot.send_invoice(
         chat_id=cb.from_user.id,
         title="Поддержка «Между нами 🤫»",
@@ -1310,9 +1420,136 @@ async def successful_payment(message: Message):
     stats_inc("donations_stars_total", stars)
 
     await message.answer(
-        f"<b>Принято</b> ⭐ {stars}\nСпасибо 😏\nМы это превратим в <b>ещё более колкие вопросы</b> 😈",
+        f"<b>Принято</b> ⭐ {stars}\n"
+        "Спасибо 😏\n"
+        "Мы это превратим в <b>ещё более колкие вопросы</b> 😈",
         parse_mode="HTML",
     )
+
+
+# =========================
+# PATCH: store current question & use comment
+# =========================
+# Мы делаем это так, чтобы не ломать dataclass: просто используем атрибут gs.current_question.
+
+async def show_round_result(chat_id: int):
+    gs = GAMES.get(chat_id)
+    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
+        return
+
+    touch(gs)
+    gs.awaiting_next = True
+
+    if gs.round_timer_task and not gs.round_timer_task.done():
+        gs.round_timer_task.cancel()
+
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
+
+    if gs.total_votes == 0:
+        await bot.send_message(
+            chat_id,
+            f"<b>ИТОГ РАУНДА {gs.round}:</b>\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
+            reply_markup=kb_result(),
+            parse_mode="HTML",
+        )
+        return
+
+    items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
+    top_uid, top_count = items[0]
+    top_all = [uid for uid, c in items if c == top_count]
+
+    lines = [f"<b>ИТОГ РАУНДА {gs.round}:</b>"]
+    for uid, c in items:
+        if c <= 0:
+            continue
+        p = gs.players.get(uid)
+        if p:
+            lines.append(f"— <b>{h(p.label)}</b>: {c}")
+
+    lines.append("")
+
+    q_text = getattr(gs, "current_question", "") or ""
+    if len(top_all) == 1 and top_uid in gs.players:
+        winner = gs.players[top_uid].label
+        lines.append(f"<b>Большинство:</b> {h(winner)}")
+        lines.append(result_comment(q_text, f"<b>{h(winner)}</b>"))
+    else:
+        names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
+        lines.append(f"<b>Ничья:</b> {h(names)}")
+        lines.append("Красиво разошлись. Но я всё равно <b>запомнил</b> 😏")
+
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="HTML")
+
+
+async def start_round(chat_id: int):
+    gs = GAMES.get(chat_id)
+    if not gs or gs.state != State.RUNNING or gs.ended:
+        return
+
+    if len(gs.players) < MIN_PLAYERS:
+        await bot.send_message(
+            chat_id,
+            "Для игры нужно <b>минимум двое</b>.\nВсе разошлись? Я тоже 😏",
+            parse_mode="HTML",
+        )
+        await end_game(chat_id)
+        return
+
+    touch(gs)
+
+    gs.awaiting_next = False
+    gs.extended_prompted = False
+    gs.extend_used = False
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
+
+    gs.round += 1
+    stats_inc("rounds_played", 1)
+
+    gs.votes_by_target.clear()
+    gs.voted_users.clear()
+    gs.total_votes = 0
+
+    snapshot_ids = [uid for uid in gs.join_order if uid in gs.players]
+    gs.round_voters = set(snapshot_ids)
+    gs.round_targets = snapshot_ids[:]
+
+    q, is_spicy, has_secret = choose_question(gs)
+    setattr(gs, "current_question", q)  # <-- сохраняем вопрос
+
+    q_caps = q.upper()
+
+    tags = []
+    if has_secret:
+        tags.append("Только честно 🤫")
+    if is_spicy:
+        tags.append("Отвечайте честно 😈")
+
+    tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>" if tags else ""
+    timer_line = f"\n\n<i>({ROUND_VOTE_SECONDS} сек на голосование)</i>"
+
+    text = (
+        f"<b>РАУНД {gs.round} 😈</b>\n\n"
+        f"<b>{h(q_caps)}</b>"
+        f"{tag_line}"
+        f"{timer_line}\n\n"
+        f"<b>Голосуйте</b> 👇"
+    )
+
+    if gs.round_timer_task and not gs.round_timer_task.done():
+        gs.round_timer_task.cancel()
+
+    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
+    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
 # =========================
