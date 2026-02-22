@@ -873,6 +873,12 @@ async def cb_extend(cb: CallbackQuery):
         await cb.message.edit_text(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
     except Exception:
         await cb.message.answer(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
+            # ПОВТОРНО показываем кнопки голосования, чтобы они были "перед глазами"
+    await bot.send_message(
+        chat_id,
+        "Голосуйте 👇",
+        reply_markup=kb_vote(gs),
+    )
 
 
 @dp.callback_query(F.data == "force_result")
