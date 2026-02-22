@@ -113,6 +113,30 @@ SPICY_QUESTIONS = [
     "Кто мог бы утаить правду, чтобы не выглядеть виноватым?",
 ]
 
+# 😈 Только пацаны (18–30), с действием внутри
+BOYS_ONLY_QUESTIONS = [
+    "Кто из вас пёрнет и будет до последнего делать вид, что это не он? (выбранный оправдывается как адвокат)",
+    "Кто напердит и будет угорать так, будто это стендап? (выбранный объясняет, почему ему это смешно)",
+    "Кто устроит газовую атаку и обвинит в этом мебель? (выбранный придумывает легенду)",
+    "Кто рыгнёт громче всех? (выбранный либо делает, либо публично признаёт поражение 😏)",
+    "Кто быстрее всех напивается и начинает философствовать? (выбранный выдаёт свою любимую «пьяную мудрость»)",
+    "Кто чаще всего пишет бывшим после алкоголя? (выбранный рассказывает самую нелепую причину “почему вообще написал”)",
+    "Кто чаще всех говорит «я трезвый», а через минуту уже не трезвый? (выбранный вспоминает самый позорный «я норм»)",
+    "Кто влипает в самые тупые и неловкие ситуации? (выбранный рассказывает топ-1 историю)",
+    "Кто может превратить спокойный вечер в хаос буквально из ничего? (выбранный объясняет, как это у него получается)",
+    "Кто несёт уверенную чушь так, что люди почти верят? (выбранный придумывает сейчас “факт”, который звучит правдиво)",
+    "Кто больше всех понтуется, а потом ловит жёсткий облом? (выбранный рассказывает самый смешной облом)",
+    "Кто первый полезет в конфликт из-за полной фигни? (выбранный называет самый тупой повод, из-за которого бесился)",
+    "Кто говорит «по одной» — и исчезает до утра? (выбранный рассказывает, где его потом находили)",
+    "Кто чаще всех теряет вещи по пьяни? (выбранный рассказывает, что потерял самое тупое)",
+    "Кто устроит кринж на людях и поймёт это только дома? (выбранный рассказывает лучший «стыд на утро»)",
+    "Кто вечно делает «ща сделаю» и не делает? (выбранный даёт одно публичное обещание на сегодня)",
+    "Кто будет ржать с пердежа дольше всех? (выбранный держит серьёзное лицо 10 секунд)",
+    "Кто самый опасный, когда ему скучно? (выбранный рассказывает, какую “идею” он однажды предложил)",
+    "Кто устроит эпичный фейл на ровном месте? (выбранный рассказывает свой рекорд)",
+    "Кто чаще всего встревает в разговор и делает только хуже? (выбранный признаётся, где он так «помог»)",
+]
+
 ALL_NORMAL = NORMAL_QUESTIONS[:]
 ALL_SPICY = SPICY_QUESTIONS[:]
 
@@ -146,12 +170,16 @@ class GameState:
     state: State = State.IDLE
     host_user_id: Optional[int] = None
 
+    # режим игры: all / boys
+    mode: str = "all"
+
     players: Dict[int, Player] = field(default_factory=dict)
     join_order: List[int] = field(default_factory=list)
 
     round: int = 0
     used_normal: Set[int] = field(default_factory=set)
     used_spicy: Set[int] = field(default_factory=set)
+    used_boys: Set[int] = field(default_factory=set)
 
     since_last_spicy: int = 0
     next_spicy_at: int = field(default_factory=lambda: random.randint(3, 4))
@@ -178,14 +206,17 @@ class GameState:
 
     last_next_press_ts: Dict[int, float] = field(default_factory=dict)
 
-    # один lobby message (важно)
+    # одно сообщение лобби (важно)
     lobby_msg_id: Optional[int] = None
 
-    # сообщение с кнопками голосования текущего раунда (чтобы снять клаву после итога)
+    # сообщение с кнопками голосования текущего раунда (чтобы снять клаву)
     round_msg_id: Optional[int] = None
 
     # текущий вопрос (чтобы коммент под него)
     current_question: str = ""
+
+    # токен текущего раунда (защита от “старых таймеров”)
+    round_token: int = 0
 
 
 GAMES: Dict[int, GameState] = {}
@@ -351,14 +382,13 @@ def choose_question(gs: GameState) -> Tuple[str, bool, bool]:
 
 
 def get_host(gs: GameState) -> Optional[int]:
-    # если текущий host исчез (вышел/удалён из players) — перевыбираем
+    # если текущий host исчез — перевыбираем
     if gs.host_user_id is not None and gs.host_user_id not in gs.players:
         gs.host_user_id = None
 
     if gs.host_user_id is not None:
         return gs.host_user_id
 
-    # ведущий = первый по join_order, который ещё в players
     for uid in gs.join_order:
         if uid in gs.players:
             gs.host_user_id = uid
@@ -471,6 +501,11 @@ def dm_donate_text() -> str:
 
 
 async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
+    """
+    Меню в ЛС — без тупиков:
+    - всегда редактируем текущее, если можно
+    - если нельзя — отправляем новое
+    """
     try:
         await cb.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     except TelegramBadRequest as e:
@@ -480,61 +515,61 @@ async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
 
 
 # =========================
-# RESULT COMMENTS (3 variants per matched question)
+# COMMENTS
 # =========================
-def result_comment(question: str, winner_label: str) -> str:
+def result_comment(question: str, winner_html: str) -> str:
     q = (question or "").lower()
 
     rules: List[Tuple[List[str], List[str]]] = [
         (["мастер отмазок", "отмаз"], [
-            f"{winner_label} — тебя выбрали! Как теперь <b>отмазываться</b> будешь? 😂",
-            f"{winner_label} победил(а) в номинации <b>«отмаз года»</b>. Покажи класс 😏",
-            f"{winner_label}, у нас тут <b>профессионал</b>. Дай пару уроков 🤫",
+            f"{winner_html} — тебя выбрали! Как теперь <b>отмазываться</b> будешь? 😂",
+            f"{winner_html} победил(а) в номинации <b>«отмаз года»</b>. Покажи класс 😏",
+            f"{winner_html}, у нас тут <b>профессионал</b>. Дай пару уроков 🤫",
         ]),
         (["молчать", "молчание"], [
-            f"{winner_label} — ты что, <b>«Молчание ягнят»</b> пересмотрел(а)? 😈",
-            f"{winner_label}: наказание тишиной — это <b>твой язык любви</b>? 🤫",
-            f"{winner_label} молчит так, что у людей <b>совесть просыпается</b> 😏",
+            f"{winner_html} — ты что, <b>«Молчание ягнят»</b> пересмотрел(а)? 😈",
+            f"{winner_html}: наказание тишиной — это <b>твой язык любви</b>? 🤫",
+            f"{winner_html} молчит так, что у людей <b>совесть просыпается</b> 😏",
         ]),
         (["игнор"], [
-            f"{winner_label} — чемпион по <b>игнору</b>. Связь пропала, абонент токсичен 😏",
-            f"{winner_label}: «прочитал(а) и исчез(ла)» — <b>классика жанра</b> 🤫",
-            f"{winner_label} в игноре так уверенно, будто это <b>спорт</b> 😈",
+            f"{winner_html} — чемпион по <b>игнору</b>. Связь пропала, абонент токсичен 😏",
+            f"{winner_html}: «прочитал(а) и исчез(ла)» — <b>классика жанра</b> 🤫",
+            f"{winner_html} в игноре так уверенно, будто это <b>спорт</b> 😈",
         ]),
         (["опаздыва", "опоздал"], [
-            f"{winner_label} — ты опять <b>в пути</b>? Уже третий год 😏",
-            f"{winner_label}: опоздание — это <b>стиль жизни</b> 🤫",
-            f"{winner_label} приходит позже всех, зато с <b>эффектом</b> 😈",
+            f"{winner_html} — ты опять <b>в пути</b>? Уже третий год 😏",
+            f"{winner_html}: опоздание — это <b>стиль жизни</b> 🤫",
+            f"{winner_html} приходит позже всех, зато с <b>эффектом</b> 😈",
         ]),
         (["ревнив"], [
-            f"{winner_label} — ну всё, <b>проверка сторис</b> началась 😏",
-            f"{winner_label}: ревнует так тихо, что слышно <b>всем</b> 🤫",
-            f"{winner_label} — главный(ая) по <b>контролю</b>. Пальцы в чат 😈",
+            f"{winner_html} — ну всё, <b>проверка сторис</b> началась 😏",
+            f"{winner_html}: ревнует так тихо, что слышно <b>всем</b> 🤫",
+            f"{winner_html} — главный(ая) по <b>контролю</b>. Пальцы в чат 😈",
         ]),
         (["врет", "врёт", "врать"], [
-            f"{winner_label} — мелкая ложь? Да это <b>фирменный стиль</b> 😏",
-            f"{winner_label}: «я? никогда» — звучит как <b>улика</b> 🤫",
-            f"{winner_label} врёт так мило, что люди ещё и <b>верят</b> 😈",
+            f"{winner_html} — мелкая ложь? Да это <b>фирменный стиль</b> 😏",
+            f"{winner_html}: «я? никогда» — звучит как <b>улика</b> 🤫",
+            f"{winner_html} врёт так мило, что люди ещё и <b>верят</b> 😈",
         ]),
         (["хитрый", "переговорщик", "продав"], [
-            f"{winner_label} — переговоры с тобой это <b>минус 2 нерва</b> 😏",
-            f"{winner_label} продавил(а) бы решение даже <b>улыбкой</b> 🤫",
-            f"{winner_label} — хитрость на максималках. <b>Опасно</b> 😈",
+            f"{winner_html} — переговоры с тобой это <b>минус 2 нерва</b> 😏",
+            f"{winner_html} продавил(а) бы решение даже <b>улыбкой</b> 🤫",
+            f"{winner_html} — хитрость на максималках. <b>Опасно</b> 😈",
         ]),
         (["токсич"], [
-            f"{winner_label} — устал(а) и стал(а) <b>токсик-режим</b> 😈",
-            f"{winner_label}: «я норм» — звучит как <b>угроза</b> 😏",
-            f"{winner_label} токсичит так, что хочется <b>извиниться</b> без причины 🤫",
+            f"{winner_html} — устал(а) и стал(а) <b>токсик-режим</b> 😈",
+            f"{winner_html}: «я норм» — звучит как <b>угроза</b> 😏",
+            f"{winner_html} токсичит так, что хочется <b>извиниться</b> без причины 🤫",
         ]),
         (["серый кардинал"], [
-            f"{winner_label} — главный(ая) <b>серый кардинал</b>. Мы всё поняли 😏",
-            f"{winner_label} рулит так тихо, что люди думают это их <b>идея</b> 🤫",
-            f"{winner_label}: влияние — <b>незаметное</b>, результат — жесткий 😈",
+            f"{winner_html} — главный(ая) <b>серый кардинал</b>. Мы всё поняли 😏",
+            f"{winner_html} рулит так тихо, что люди думают это их <b>идея</b> 🤫",
+            f"{winner_html}: влияние — <b>незаметное</b>, результат — жесткий 😈",
         ]),
         (["внимание"], [
-            f"{winner_label} — центр внимания по умолчанию. <b>Привычно</b> 😏",
-            f"{winner_label}: без аплодисментов день не считается? 🤫",
-            f"{winner_label} любит внимание так, что оно само <b>приходит</b> 😈",
+            f"{winner_html} — центр внимания по умолчанию. <b>Привычно</b> 😏",
+            f"{winner_html}: без аплодисментов день не считается? 🤫",
+            f"{winner_html} любит внимание так, что оно само <b>приходит</b> 😈",
         ]),
     ]
 
@@ -543,11 +578,127 @@ def result_comment(question: str, winner_label: str) -> str:
             return pick(variants)
 
     generic = [
-        f"{winner_label} — тебя выбрали. <b>Узнаёшь себя?</b> 😏",
-        f"{winner_label}, поздравляю: ты сегодня <b>в центре сюжета</b> 😈",
-        f"{winner_label} — большинством голосов. <b>Комментарий будет?</b> 🤫",
+        f"{winner_html} — тебя выбрали. <b>Узнаёшь себя?</b> 😏",
+        f"{winner_html}, поздравляю: ты сегодня <b>в центре сюжета</b> 😈",
+        f"{winner_html} — большинством голосов. <b>Комментарий будет?</b> 🤫",
     ]
     return pick(generic)
+
+
+def boys_result_comment(question: str, winner_html: str) -> str:
+    # 1:1 — чтобы коммент всегда подходил на 100%
+    BOYS_COMMENTS = {
+        BOYS_ONLY_QUESTIONS[0]: [
+            f"{winner_html} — ну ты крыса. Навонял и молчишь 😏",
+            f"{winner_html} — запах есть, совести нет 😂",
+            f"{winner_html} — оправдывайся. Суд присяжных уже тут 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[1]: [
+            f"{winner_html} — тебе смешно, а людям жить дальше 😂",
+            f"{winner_html} — ты реально этим гордишься? 😏",
+            f"{winner_html} — ещё раз — и тебя выносят вместе с атмосферой 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[2]: [
+            f"{winner_html} — мебель не виновата. Это ты 😏",
+            f"{winner_html} — легенда слабая. Запах сильный 😂",
+            f"{winner_html} — фальшивый алиби. Признание принимаем 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[3]: [
+            f"{winner_html} — ну всё, концерт. Или трус 😏",
+            f"{winner_html} — давай, без монтажа 😂",
+            f"{winner_html} — мы верим в тебя. К сожалению 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[4]: [
+            f"{winner_html} — пьяная мудрость активирована. Ждём цитату 😏",
+            f"{winner_html} — сейчас будет «а вот жизнь…» 😂",
+            f"{winner_html} — говори. Потом мы это тебе припомним 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[5]: [
+            f"{winner_html} — ночные сообщения — твой спорт? 😏",
+            f"{winner_html} — главное потом не делай вид, что «это не я» 😂",
+            f"{winner_html} — причина? Давай, удиви нас 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[6]: [
+            f"{winner_html} — «я трезвый» звучит как угроза 😏",
+            f"{winner_html} — твой режим “нормальный” длится минуту 😂",
+            f"{winner_html} — рассказывай позор. Мы готовы 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[7]: [
+            f"{winner_html} — у тебя талант: кринж находить самому 😏",
+            f"{winner_html} — давай историю. Мы хотим страдать 😂",
+            f"{winner_html} — рассказывай. И не приукрашивай 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[8]: [
+            f"{winner_html} — ты хаос или хаос — это ты? 😏",
+            f"{winner_html} — “просто посидели” с тобой не бывает 😂",
+            f"{winner_html} — объясни механику. Наука требует 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[9]: [
+            f"{winner_html} — уверенность есть, фактов нет 😏",
+            f"{winner_html} — скажи ещё раз — почти поверили 😂",
+            f"{winner_html} — давай свой “факт”. Мы проверять не будем 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[10]: [
+            f"{winner_html} — понты сгорели, пепел остался 😏",
+            f"{winner_html} — рассказывай облом. Смакуем 😂",
+            f"{winner_html} — это был сильный выход… в никуда 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[11]: [
+            f"{winner_html} — повод тупой, эмоции максимальные 😏",
+            f"{winner_html} — ты реально заводишься от воздуха? 😂",
+            f"{winner_html} — назови повод. Мы оценим уровень идиотизма 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[12]: [
+            f"{winner_html} — «по одной» и ушёл в легенды 😏",
+            f"{winner_html} — ну давай: где тебя нашли? 😂",
+            f"{winner_html} — маршрут пропажи в студию 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[13]: [
+            f"{winner_html} — у тебя в карманах портал? 😏",
+            f"{winner_html} — что потерял — самое тупое? Давай 😂",
+            f"{winner_html} — ты не теряешь вещи. Ты их освобождаешь 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[14]: [
+            f"{winner_html} — кринж на людях, стыд дома. Классика 😏",
+            f"{winner_html} — рассказывай. Мы осудим, но любя 😂",
+            f"{winner_html} — давай “стыд на утро”. Без цензуры 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[15]: [
+            f"{winner_html} — «ща сделаю» — и исчез 😏",
+            f"{winner_html} — одно обещание. И мы следим 😂",
+            f"{winner_html} — давай. Сегодня ты отвечаешь за слова 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[16]: [
+            f"{winner_html} — улыбка исчезла. Держи лицо 😏",
+            f"{winner_html} — 10 секунд серьёзности. Слабо? 😂",
+            f"{winner_html} — выдержишь — мы тебя простим. Почти 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[17]: [
+            f"{winner_html} — когда тебе скучно, всем страшно 😏",
+            f"{winner_html} — расскажи “идею”. Мы заранее против 😂",
+            f"{winner_html} — давай, что ты придумал тогда? 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[18]: [
+            f"{winner_html} — фейл на ровном месте — твой стиль 😏",
+            f"{winner_html} — давай рекорд. Хотим удивиться 😂",
+            f"{winner_html} — рассказывай. И не смягчай 😈",
+        ],
+        BOYS_ONLY_QUESTIONS[19]: [
+            f"{winner_html} — влез и стало хуже. Легенда 😏",
+            f"{winner_html} — где ты “помог” так, что лучше бы молчал? 😂",
+            f"{winner_html} — признавайся. Мы не забываем 😈",
+        ],
+    }
+
+    variants = BOYS_COMMENTS.get(question)
+    if variants:
+        return random.choice(variants)
+
+    return random.choice([
+        f"{winner_html} — ну всё, тебя выбрали. Давай без задней 😏",
+        f"{winner_html} — компания решила. И это приговор 😂",
+        f"{winner_html} — сегодня ты главный герой. Соболезную 😈",
+    ])
 
 
 # =========================
@@ -574,18 +725,37 @@ def kb_dm_back():
 def kb_dm_donate_amounts():
     b = InlineKeyboardBuilder()
     for amt in [10, 25, 50, 100, 250, 500, 1000]:
-        b.button(text=f"⭐ {amt}", callback_data=f"donate:{amt}")
+        b.button(text=f"⭐ {amt}", callback_data=f"donate_amount:{amt}")
     b.button(text="⬅️ Назад", callback_data="dm_back")
     b.adjust(3, 2, 2, 1)
     return b.as_markup()
 
 
-def kb_group_lobby():
+def kb_dm_donate_confirm(amount: int):
     b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Оплатить ⭐ {amount}", callback_data=f"donate_pay:{amount}")
+    b.button(text="⬅️ Назад", callback_data="dm_donate")
+    b.adjust(1, 1)
+    return b.as_markup()
+
+
+def kb_group_lobby(gs: GameState):
+    b = InlineKeyboardBuilder()
+
+    # режимы
+    if gs.mode == "all":
+        b.button(text="🔥 Режимчик для всех", callback_data="mode_all")
+        b.button(text="😈 Только пацаны", callback_data="mode_boys")
+    else:
+        b.button(text="😈 Только пацаны", callback_data="mode_boys")
+        b.button(text="🔥 Режимчик для всех", callback_data="mode_all")
+
+    # действия
     b.button(text="✅ Присоединиться", callback_data="join")
     b.button(text="🔥 Ну что? Погнали?", callback_data="start")
     b.button(text="Отмена", callback_data="cancel")
-    b.adjust(1, 1, 1)
+
+    b.adjust(2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -637,8 +807,12 @@ def kb_end_confirm():
 def lobby_text(gs: GameState) -> str:
     players = [gs.players[uid].label for uid in gs.join_order if uid in gs.players]
     lines = "\n".join([f"• {h(x)}" for x in players]) if players else "Пока никого."
+
+    mode_line = "🔥 <b>Режим:</b> для всех" if gs.mode == "all" else "😈 <b>Режим:</b> только пацаны"
+
     return (
         "<b>МЕЖДУ НАМИ</b> 🤫\n\n"
+        f"{mode_line}\n\n"
         "Собираю игроков.\n"
         "Жмите <b>«Присоединиться»</b>.\n\n"
         f"<b>В игре:</b>\n{lines}\n\n"
@@ -654,14 +828,14 @@ async def lobby_upsert(gs: GameState):
                 chat_id=gs.chat_id,
                 message_id=gs.lobby_msg_id,
                 text=text,
-                reply_markup=kb_group_lobby(),
+                reply_markup=kb_group_lobby(gs),
                 parse_mode="HTML",
             )
             return
     except Exception:
         pass
 
-    m = await bot.send_message(gs.chat_id, text, reply_markup=kb_group_lobby(), parse_mode="HTML")
+    m = await bot.send_message(gs.chat_id, text, reply_markup=kb_group_lobby(gs), parse_mode="HTML")
     gs.lobby_msg_id = m.message_id
 
 
@@ -677,7 +851,7 @@ async def cleanup_game(gs: GameState):
     if gs.watchdog_task and not gs.watchdog_task.done():
         gs.watchdog_task.cancel()
 
-    # убираем служебные сообщения/кнопки
+    # убрать “продлить?”
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(gs.chat_id, gs.extend_prompt_msg_id)
@@ -685,9 +859,11 @@ async def cleanup_game(gs: GameState):
             pass
         gs.extend_prompt_msg_id = None
 
-    # "обезоружить" старые кнопки, чтобы не было клик-хаоса
+    # обезоружить кнопки
     await safe_clear_markup(gs.chat_id, gs.round_msg_id)
     await safe_clear_markup(gs.chat_id, gs.lobby_msg_id)
+
+    gs.round_msg_id = None
 
 
 async def reminder_loop():
@@ -768,7 +944,7 @@ def ensure_watchdog(gs: GameState):
 
 
 # =========================
-# ROUND FLOW
+# ROUND FLOW (token-safe)
 # =========================
 async def start_round(chat_id: int):
     gs = GAMES.get(chat_id)
@@ -786,7 +962,7 @@ async def start_round(chat_id: int):
 
     touch(gs)
 
-    # обезоруживаем прошлые кнопки раунда
+    # обезоруживаем прошлые кнопки раунда (если вдруг остались)
     await safe_clear_markup(chat_id, gs.round_msg_id)
     gs.round_msg_id = None
 
@@ -812,9 +988,15 @@ async def start_round(chat_id: int):
     gs.round_voters = set(snapshot_ids)
     gs.round_targets = snapshot_ids[:]
 
-    q, is_spicy, has_secret = choose_question(gs)
-    gs.current_question = q
+    # выбираем вопрос по режиму
+    if gs.mode == "boys":
+        q = pick_from_pool(gs.used_boys, BOYS_ONLY_QUESTIONS)
+        is_spicy = False
+        has_secret = False
+    else:
+        q, is_spicy, has_secret = choose_question(gs)
 
+    gs.current_question = q
     q_caps = q.upper()
 
     tags = []
@@ -826,23 +1008,31 @@ async def start_round(chat_id: int):
     tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>" if tags else ""
     timer_line = f"\n\n<i>({ROUND_VOTE_SECONDS} сек на голосование)</i>"
 
+    mode_line = "😈 <b>ТОЛЬКО ПАЦАНЫ</b>\n\n" if gs.mode == "boys" else ""
+
     text = (
         f"<b>РАУНД {gs.round} 😈</b>\n\n"
+        f"{mode_line}"
         f"<b>{h(q_caps)}</b>"
         f"{tag_line}"
         f"{timer_line}\n\n"
         f"<b>Голосуйте</b> 👇"
     )
 
+    # новый раунд -> новый токен (любой старый таймер “протух”)
+    gs.round_token += 1
+    token = gs.round_token
+
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
     m = await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
     gs.round_msg_id = m.message_id
-    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
+
+    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS, token))
 
 
-async def round_timer(chat_id: int, seconds: int):
+async def round_timer(chat_id: int, seconds: int, token: int):
     try:
         await asyncio.sleep(seconds)
     except asyncio.CancelledError:
@@ -852,7 +1042,10 @@ async def round_timer(chat_id: int, seconds: int):
     if not gs or gs.state != State.RUNNING or gs.ended:
         return
 
-    # если итог уже посчитан — молчим
+    # если это таймер не текущего раунда — молча уходим
+    if token != gs.round_token:
+        return
+
     if gs.awaiting_next:
         return
 
@@ -874,15 +1067,18 @@ async def round_timer(chat_id: int, seconds: int):
         gs.extend_prompt_msg_id = m.message_id
         return
 
-    await show_round_result(chat_id)
+    await show_round_result(chat_id, token)
 
 
-async def show_round_result(chat_id: int):
+async def show_round_result(chat_id: int, token: int):
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING or gs.ended:
         return
 
-    # 🔒 анти-гонка: если уже считаем итог — второй раз не заходим
+    if token != gs.round_token:
+        return
+
+    # анти-гонка: итог только один раз
     if gs.awaiting_next:
         return
     gs.awaiting_next = True
@@ -899,8 +1095,9 @@ async def show_round_result(chat_id: int):
             pass
         gs.extend_prompt_msg_id = None
 
-    # убрать кнопки голосования у сообщения раунда
+    # снять кнопки голосования у сообщения раунда
     await safe_clear_markup(chat_id, gs.round_msg_id)
+    gs.round_msg_id = None
 
     if gs.total_votes == 0:
         await bot.send_message(
@@ -930,7 +1127,12 @@ async def show_round_result(chat_id: int):
     if len(top_all) == 1 and top_uid in gs.players:
         winner = gs.players[top_uid].label
         lines.append(f"<b>Большинство:</b> {h(winner)}")
-        lines.append(result_comment(q_text, f"<b>{h(winner)}</b>"))
+
+        winner_html = f"<b>{h(winner)}</b>"
+        if gs.mode == "boys":
+            lines.append(boys_result_comment(q_text, winner_html))
+        else:
+            lines.append(result_comment(q_text, winner_html))
     else:
         names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
         lines.append(f"<b>Ничья:</b> {h(names)}")
@@ -953,7 +1155,7 @@ async def end_game(chat_id: int, reason: str = ""):
 
 
 # =========================
-# DM
+# DM handlers
 # =========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -1046,6 +1248,28 @@ async def start_lobby(message: Message):
     touch(gs)
     ensure_watchdog(gs)
 
+    await lobby_upsert(gs)
+
+
+@dp.callback_query(F.data == "mode_all")
+async def cb_mode_all(cb: CallbackQuery):
+    gs = GAMES.get(cb.message.chat.id)
+    if not gs or gs.ended or gs.state != State.LOBBY:
+        await cb.answer("Поздно менять 😏", show_alert=True)
+        return
+    gs.mode = "all"
+    await cb.answer("Ок 🔥 Для всех")
+    await lobby_upsert(gs)
+
+
+@dp.callback_query(F.data == "mode_boys")
+async def cb_mode_boys(cb: CallbackQuery):
+    gs = GAMES.get(cb.message.chat.id)
+    if not gs or gs.ended or gs.state != State.LOBBY:
+        await cb.answer("Поздно менять 😏", show_alert=True)
+        return
+    gs.mode = "boys"
+    await cb.answer("Ок 😈 Только пацаны")
     await lobby_upsert(gs)
 
 
@@ -1178,7 +1402,7 @@ async def cb_vote(cb: CallbackQuery):
     if len(gs.voted_users) >= len(gs.round_voters):
         if gs.round_timer_task and not gs.round_timer_task.done():
             gs.round_timer_task.cancel()
-        await show_round_result(chat_id)
+        await show_round_result(chat_id, gs.round_token)
 
 
 @dp.callback_query(F.data == "extend")
@@ -1213,7 +1437,9 @@ async def cb_extend(cb: CallbackQuery):
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
-    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
+
+    # ВАЖНО: продление в рамках того же round_token
+    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS, gs.round_token))
 
     try:
         await cb.message.delete()
@@ -1241,7 +1467,7 @@ async def cb_force_result(cb: CallbackQuery):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    await show_round_result(chat_id)
+    await show_round_result(chat_id, gs.round_token)
 
 
 @dp.callback_query(F.data == "next")
@@ -1412,7 +1638,7 @@ async def cmd_stats(message: Message):
 
 
 # =========================
-# DONATE (Stars)
+# DONATE (Stars) — без тупиков
 # =========================
 @dp.message(Command("donate"))
 async def cmd_donate(message: Message):
@@ -1425,8 +1651,33 @@ async def cmd_donate(message: Message):
     )
 
 
-@dp.callback_query(F.data.startswith("donate:"))
-async def cb_donate(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("donate_amount:"))
+async def cb_donate_amount(cb: CallbackQuery):
+    """
+    ВАЖНО: НЕ шлём invoice сразу.
+    Сначала экран подтверждения с кнопкой Назад — чтобы не было тупика.
+    """
+    await cb.answer()
+    try:
+        amount = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.message.answer("Что-то пошло не так 😏")
+        return
+    if amount <= 0:
+        await cb.message.answer("Слишком хитро 😈")
+        return
+
+    text = (
+        f"*Поддержка Stars* ⭐\n\n"
+        f"Сумма: *⭐ {amount}*\n\n"
+        "Нажмёшь оплатить — откроется экран Telegram.\n"
+        "Передумал? Жми назад 😏"
+    )
+    await dm_edit_menu(cb, text, kb_dm_donate_confirm(amount))
+
+
+@dp.callback_query(F.data.startswith("donate_pay:"))
+async def cb_donate_pay(cb: CallbackQuery):
     await cb.answer()
     try:
         amount = int(cb.data.split(":", 1)[1])
@@ -1482,7 +1733,10 @@ async def main():
     BOT_USERNAME = (me.username or "").strip()
     print(f"✅ Started as @{BOT_USERNAME}")
 
+    # напоминалка в фоне
     asyncio.create_task(reminder_loop())
+
+    # polling
     await dp.start_polling(bot)
 
 
