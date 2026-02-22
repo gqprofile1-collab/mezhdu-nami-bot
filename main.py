@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Set, Optional, List, Tuple
+import json
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -31,6 +33,13 @@ LOBBY_CLOSE_SEC = 5 * 60
 SESSION_CLOSE_SEC = 10 * 60
 
 NEXT_COOLDOWN_SEC = 1.0
+
+# =========================
+# REMINDERS
+# =========================
+CHATS_STORE_PATH = "chats.json"
+REMIND_EVERY_SEC = 3 * 24 * 60 * 60   # 3 дня
+REMIND_CHECK_SEC = 60 * 60            # проверка раз в час
 
 
 # =========================
@@ -190,6 +199,7 @@ def md_bold_caps(text: str) -> str:
 # =========================
 def touch(gs: GameState):
     gs.last_activity = datetime.utcnow()
+    mark_chat_started(gs.chat_id)
 
 
 def anti_spam_next_ok(gs: GameState, user_id: int) -> bool:
@@ -281,6 +291,87 @@ def get_host(gs: GameState) -> Optional[int]:
 
 
 # =========================
+# REMINDERS
+# =========================
+def _load_chats_store() -> Dict[str, Dict]:
+    p = Path(CHATS_STORE_PATH)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_chats_store(data: Dict[str, Dict]) -> None:
+    p = Path(CHATS_STORE_PATH)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def mark_chat_started(chat_id: int) -> None:
+    """
+    Фиксируем, что игра в этом чате реально стартовала.
+    """
+    data = _load_chats_store()
+    key = str(chat_id)
+    now = int(time.time())
+    meta = data.get(key, {})
+    meta["last_started_ts"] = now
+    meta.setdefault("last_reminded_ts", 0)
+    data[key] = meta
+    _save_chats_store(data)
+
+async def reminder_loop():
+    """
+    Раз в час проверяет чаты, где игра стартовала,
+    и если 3 дня тишины — зовёт сыграть снова (1 раз после последнего старта).
+    """
+    while True:
+        try:
+            await asyncio.sleep(REMIND_CHECK_SEC)
+            data = _load_chats_store()
+            now = int(time.time())
+
+            for key, meta in list(data.items()):
+                try:
+                    chat_id = int(key)
+                except Exception:
+                    continue
+
+                last_started = int(meta.get("last_started_ts", 0))
+                last_reminded = int(meta.get("last_reminded_ts", 0))
+
+                if last_started <= 0:
+                    continue
+
+                # прошло 3 дня с момента старта игры
+                if now - last_started < REMIND_EVERY_SEC:
+                    continue
+
+                # напомнить только один раз после последнего старта
+                if last_reminded >= last_started:
+                    continue
+
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "Эй 😏\n"
+                        "Три дня тишины…\n"
+                        "Может, сыграем снова в «Между нами 🤫»?\n\n"
+                        "Напишите: «Начать игру» 👇",
+                    )
+                    meta["last_reminded_ts"] = now
+                    data[key] = meta
+                except Exception:
+                    continue
+
+            _save_chats_store(data)
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            continue
+
+
+# =========================
 # KEYBOARDS
 # =========================
 def kb_lobby(gs: GameState):
@@ -293,13 +384,12 @@ def kb_lobby(gs: GameState):
 
 
 def kb_vote(gs: GameState):
-    # Во время вопроса НЕ добавляем "в игру" — как ты сказал
+    # Важно: во время вопроса НЕ показываем кнопку "добавить"
     b = InlineKeyboardBuilder()
     targets = [(uid, gs.players[uid]) for uid in gs.round_targets if uid in gs.players]
     targets.sort(key=lambda x: x[1].label.lower())
 
     for uid, p in targets:
-        # В inline-кнопках разметка не работает — plain text
         b.button(text=p.label, callback_data=f"vote:{uid}")
 
     cols = 2 if len(targets) <= 6 else 3
@@ -339,7 +429,7 @@ def kb_paused():
 def kb_not_all_voted():
     b = InlineKeyboardBuilder()
     b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")
-    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")  # только ведущий
+    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")  # только ведущему
     b.button(text="🛑 Завершить", callback_data="end")
     b.adjust(1, 1, 1)
     return b.as_markup()
@@ -370,7 +460,6 @@ async def watchdog(chat_id: int):
                 pass
 
         if gs.state != State.IDLE and idle_sec >= SESSION_CLOSE_SEC:
-            # закрываем игру
             await end_game(chat_id, reason="10 минут тишины 😴\nЯ закрываю игру.")
             return
 
@@ -451,7 +540,6 @@ async def round_timer(chat_id: int, seconds: int):
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
 
-    # Время вышло → если не все проголосовали (или вообще никто) и ещё не продлевали — предлагаем
     if not gs.extended_once and (not_all_voted or gs.total_votes == 0):
         gs.extended_once = True
         touch(gs)
@@ -475,51 +563,7 @@ async def round_timer(chat_id: int, seconds: int):
         await bot.send_message(chat_id, msg, reply_markup=kb_not_all_voted())
         return
 
-    # Иначе показываем результат
     await show_round_result(chat_id)
-
-
-def reaction_for_result(items: List[Tuple[int, int]], total_votes: int) -> str:
-    if total_votes == 0:
-        return "Никто не рискнул. Слишком мило 🤨"
-
-    top_count = items[0][1] if items else 0
-    second = items[1][1] if len(items) > 1 else 0
-    top_all = [uid for uid, c in items if c == top_count]
-
-    if len(top_all) > 1:
-        return random.choice([
-            "Мнения разделились. У вас тут своя дипломатия 😏",
-            "Поровну. Никто не захотел быть крайним 🤫",
-            "Ничья. Санта-Барбара продолжается 😈",
-        ])
-
-    if top_count == total_votes and total_votes >= 2:
-        return random.choice([
-            "Единогласно. Тут даже обсуждать нечего 😈",
-            "Ну всё, спалили. Весь чат согласен 🤭",
-            "Ого. Хором. Больно, наверное 🤫",
-        ])
-
-    if top_count - second == 1:
-        return random.choice([
-            "На тоненького. Едва-едва 😏",
-            "Разрыв минимальный. Почти ничья 🤫",
-            "Ух. С минимальным отрывом 😈",
-        ])
-
-    if top_count >= second + 3:
-        return random.choice([
-            "Сильный перевес. Вы прям уверены 😏",
-            "Похоже, всё очевидно 😈",
-            "Ну да… вопросов не осталось 🤫",
-        ])
-
-    return random.choice([
-        "Интересно… 😏",
-        "Окей. Занёс в протокол 😈",
-        "Запомним. 🤫",
-    ])
 
 
 async def show_round_result(chat_id: int):
@@ -533,7 +577,6 @@ async def show_round_result(chat_id: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    # если 0 голосов — отдельный итог
     if gs.total_votes == 0:
         text = (
             f"Итог раунда {gs.round}:\n"
@@ -546,7 +589,6 @@ async def show_round_result(chat_id: int):
 
         lines: List[str] = [f"Итог раунда {gs.round}:"]
 
-        # имена жирные (MarkdownV2)
         for uid, c in items:
             p = gs.players.get(uid)
             if p and c > 0:
@@ -574,7 +616,6 @@ async def show_round_result(chat_id: int):
 
         await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="MarkdownV2")
 
-    # каждые 5 раундов — пауза
     if gs.round % 5 == 0:
         gs.pause_gate = True
         await bot.send_message(
@@ -584,42 +625,6 @@ async def show_round_result(chat_id: int):
             "Идём дальше? 😏",
             reply_markup=kb_pause_gate(),
         )
-
-
-# =========================
-# FINAL (Top-3 total)
-# =========================
-def final_top3_text(gs: GameState) -> str:
-    played = gs.round
-    if not gs.players:
-        return "Игра окончена. Но вы даже не собрались 🤷‍♂️"
-
-    ranking = sorted(gs.players.values(), key=lambda p: p.score, reverse=True)
-    if not ranking or ranking[0].score == 0:
-        return (
-            "Игра окончена 🛑\n\n"
-            f"Сыграли: {played} раундов\n"
-            "И… вы почти никого не выбирали.\n"
-            "Подозрительно мирная компания 🤨\n\n"
-            "Это между нами 🤫"
-        )
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [
-        "Игра окончена 🛑",
-        "",
-        f"Сыграли: {played} раундов",
-        "Чаще всего выбирали (ТОП-3):",
-    ]
-    for i, p in enumerate(ranking[:3]):
-        lines.append(f"{medals[i]} {p.label} — {p.score}")
-
-    lines += [
-        "",
-        "Интересная компания. Очень 😈",
-        "Это между нами 🤫",
-    ]
-    return "\n".join(lines)
 
 
 async def end_game(chat_id: int, reason: str = ""):
@@ -745,7 +750,6 @@ async def cb_join(cb: CallbackQuery):
     gs.players[uid] = Player(user_id=uid, name=name, label=label)
     gs.join_order.append(uid)
 
-    # если создатель вышел — ведущий = первый
     get_host(gs)
 
     await cb.answer("Записал ✅", show_alert=False)
@@ -790,10 +794,7 @@ async def cb_start(cb: CallbackQuery):
     gs.state = State.RUNNING
     touch(gs)
 
-    try:
-        await cb.message.edit_text("Ну что? Погнали? 🔥\nТолько без обид… это между нами 🤫")
-    except Exception:
-        await cb.message.answer("Ну что? Погнали? 🔥\nТолько без обид… это между нами 🤫")
+    mark_chat_started(chat_id)  # Запоминаем, что игра началась
 
     await cb.answer("Поехали")
     await start_round(chat_id)
@@ -836,14 +837,12 @@ async def cb_vote(cb: CallbackQuery):
     gs.votes_by_target[target_id] = gs.votes_by_target.get(target_id, 0) + 1
     gs.total_votes += 1
 
-    # общая статистика
     if target_id in gs.players:
         gs.players[target_id].score += 1
 
     target_label = gs.players[target_id].label if target_id in gs.players else "кто-то"
     await cb.answer(f"Засчитано ✅ ({target_label})", show_alert=False)
 
-    # если все проголосовали — результат сразу
     if len(gs.voted_users) >= len(gs.round_voters):
         if gs.round_timer_task and not gs.round_timer_task.done():
             gs.round_timer_task.cancel()
@@ -873,12 +872,6 @@ async def cb_extend(cb: CallbackQuery):
         await cb.message.edit_text(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
     except Exception:
         await cb.message.answer(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
-            # ПОВТОРНО показываем кнопки голосования, чтобы они были "перед глазами"
-    await bot.send_message(
-        chat_id,
-        "Голосуйте 👇",
-        reply_markup=kb_vote(gs),
-    )
 
 
 @dp.callback_query(F.data == "force_result")
@@ -992,6 +985,7 @@ async def cb_end(cb: CallbackQuery):
 # MAIN
 # =========================
 async def main():
+    asyncio.create_task(reminder_loop())  # Запуск напоминаний
     await dp.start_polling(bot)
 
 
