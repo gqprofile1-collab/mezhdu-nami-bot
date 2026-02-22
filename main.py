@@ -196,6 +196,9 @@ class GameState:
     extend_used: bool = False
     extend_prompt_msg_id: Optional[int] = None
 
+    # ✅ 1 = первая попытка, 2 = продление (вторая попытка)
+    vote_phase: int = 1
+
     awaiting_next: bool = False
     ended: bool = False
 
@@ -468,7 +471,7 @@ TIMEUP_MISSING = [
     "Жду <b>{missing}</b>.\nНо недолго 😈",
 ]
 
-# ✅ После продления всё равно не доголосовали
+# ✅ фраза “вторая попытка была, но…”
 SECOND_CHANCE_FAIL = [
     "Даже после второй попытки… <b>кто-то не справился с такой простой задачей</b> 😏",
     "Продлили. Подождали. И всё равно <b>кто-то</b> сдался 🤫",
@@ -1000,6 +1003,7 @@ async def start_round(chat_id: int):
     gs.awaiting_next = False
     gs.extended_prompted = False
     gs.extend_used = False
+    gs.vote_phase = 1  # ✅ первая попытка
 
     if gs.extend_prompt_msg_id:
         try:
@@ -1058,6 +1062,7 @@ async def start_round(chat_id: int):
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS, token))
 
 
+# ✅ FIX: вторая попытка всегда заканчивается итогом
 async def round_timer(chat_id: int, seconds: int, token: int):
     try:
         await asyncio.sleep(seconds)
@@ -1070,11 +1075,18 @@ async def round_timer(chat_id: int, seconds: int, token: int):
     if token != gs.round_token or gs.awaiting_next:
         return
 
+    touch(gs)
+
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
 
+    # ✅ Если уже фаза 2 — всегда итог, без промптов/повторов
+    if gs.vote_phase >= 2:
+        await show_round_result(chat_id, token)
+        return
+
+    # ✅ Первая попытка: если не все проголосовали (или 0 голосов) — показываем промпт
     if not gs.extended_prompted and (not_all_voted or gs.total_votes == 0):
         gs.extended_prompted = True
-        touch(gs)
 
         missing = len(gs.round_voters) - len(gs.voted_users)
         msg = random.choice(TIMEUP_NO_VOTES) if gs.total_votes == 0 else random.choice(TIMEUP_MISSING).format(missing=missing)
@@ -1088,6 +1100,7 @@ async def round_timer(chat_id: int, seconds: int, token: int):
         gs.extend_prompt_msg_id = m.message_id
         return
 
+    # если промпт уже был — тоже считаем
     await show_round_result(chat_id, token)
 
 
@@ -1114,7 +1127,7 @@ async def show_round_result(chat_id: int, token: int):
     # ✅ пометка “вторая попытка была, но…”
     missing = len(gs.round_voters) - len(gs.voted_users)
     second_chance_line = ""
-    if gs.extend_used and missing > 0:
+    if gs.vote_phase >= 2 and missing > 0:
         second_chance_line = "\n" + random.choice(SECOND_CHANCE_FAIL) + "\n"
 
     await safe_clear_markup(chat_id, gs.round_msg_id)
@@ -1510,6 +1523,7 @@ async def cb_extend(cb: CallbackQuery):
         return
 
     gs.extend_used = True
+    gs.vote_phase = 2  # ✅ вторая попытка
     touch(gs)
     await cb.answer(f"+{EXTEND_SECONDS} сек 😏")
 
