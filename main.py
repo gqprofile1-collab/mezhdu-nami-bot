@@ -160,12 +160,12 @@ class GameState:
 
     # таймеры/защита
     extended_once: bool = False          # показали предложение продлить
-    extend_used: bool = False            # продление реально сделали (1 раз)
+    extend_used: bool = False            # ведущий реально продлил (1 раз)
     awaiting_next: bool = False
     pause_gate: bool = False
 
-    # IDs сообщений (для удаления/контроля)
-    current_vote_msg_id: Optional[int] = None     # сообщение с кнопками игроков
+    # IDs сообщений
+    current_vote_msg_id: Optional[int] = None     # сообщение с кнопками игроков (голосовалка)
     extend_prompt_msg_id: Optional[int] = None    # служебное сообщение "продлим?"
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
@@ -197,6 +197,112 @@ def md_italic(text: str) -> str:
 
 def md_bold_caps(text: str) -> str:
     return md_bold(text.upper())
+
+
+# =========================
+# PHRASES (10 variants)
+# =========================
+def end_phrase_normal() -> str:
+    return random.choice([
+        "Было опасно весело 😈\nВозвращайтесь. Я люблю наблюдать.",
+        "Ну всё 🤫\nКомпания интересная. Запомним.",
+        "Это было неловко… и прекрасно 😏\nЗалетайте ещё.",
+        "Хорошо разогрелись.\nВ следующий раз будет жарче 😈",
+        "Вы вообще понимаете, что тут происходило? 😏\nПродолжим потом.",
+        "Никто не поссорился — удивительно 🫠\nЗначит, ещё сыграем.",
+        "Атмосфера была подозрительно приятной 😈\nМне нравится.",
+        "Я всё записал.\nНо это между нами 🤫",
+        "Ну что… вы справились.\nНо можно и лучше 😏",
+        "Добавите меня в другой чат?\nИнтересно, кто там самый опасный 😈",
+    ])
+
+
+def end_phrase_inactive() -> str:
+    return random.choice([
+        "10 минут тишины… я понял 🫠\nЗакрываю игру.\n\nВернётесь — продолжим.",
+        "Чат ушёл в спячку 😴\nЯ закрываю игру.\n\nНо я не обижаюсь.",
+        "Тишина подозрительная 🤨\nЗакрываю сессию.\n\nЭто было красиво.",
+        "Похоже, кто-то испугался результатов 😏\nЗакрываю игру.",
+        "Ладно.\nПусть интрига повисит в воздухе 🤫",
+        "Я подожду в тени.\nНо игру закрываю 😈",
+        "Вы резко стали тихими… интересно почему 🫠\nЗакрываю.",
+        "Энергия ушла.\nНо атмосфера осталась 😏",
+        "Оставим это как незавершённый диалог 🤫",
+        "Я закрою игру.\nНо мы ещё не договорили 😈",
+    ])
+
+
+def cancel_phrase() -> str:
+    return random.choice([
+        "Ок. Отменяем 😏\nИнтрига остаётся.",
+        "Передумали? Интересно 🤫",
+        "Ладно.\nВ этот раз без разоблачений 😈",
+        "Сбросили.\nНо я всё видел.",
+        "Отмена принята.\nСлишком горячо стало?",
+        "Ну всё.\nРазошлись красиво.",
+        "Иногда лучше остановиться 😏",
+        "Ок.\nНо я ожидал продолжения.",
+        "Спаслись 😈\nПока.",
+        "Сценарий переписан.\nПопробуем снова?",
+    ])
+
+
+def time_up_phrase(missing: int, no_votes: bool) -> str:
+    if no_votes:
+        return random.choice([
+            "Время вышло ⏰\nИ… никто не рискнул 😏",
+            "15 секунд прошло.\nТишина.\nИнтересно 🤫",
+            "Никто не нажал.\nБоимся?",
+            "Подозрительная пауза… 🫠",
+            "Так тихо стало.\nМне даже неловко.",
+            "Вы там живы? 😈\nПока что никто не голосовал.",
+            "Слишком мирно.\nТак не бывает.",
+            "Ноль голосов.\nЗапомним этот момент.",
+            "Тишина на весь чат.\nКрасиво, но странно.",
+            "Никто никого.\nЯ в шоке 😏",
+        ])
+    return random.choice([
+        f"Время вышло ⏰\nЕщё {missing} человек молчат…",
+        f"{missing} всё ещё думают 😏",
+        f"Кто-то тянет драму.\nЕщё {missing} без голоса.",
+        f"Не все готовы признаться 😈\nОсталось: {missing}",
+        f"Ожидание затянулось.\nЕщё {missing} не нажали.",
+        f"{missing} человек держат паузу.\nСильный ход 🤫",
+        f"Время. А молчуны ещё тут: {missing}.",
+        f"Ещё {missing} и можно делать выводы 😏",
+        f"{missing} не проголосовали.\nЯ вижу всё 👀",
+        f"Почти все успели.\nНо {missing} решили исчезнуть 😈",
+    ])
+
+
+def already_voted_phrase() -> str:
+    return random.choice([
+        "Ты уже сделал выбор 😏",
+        "Повторно нельзя.\nРешения — это серьёзно.",
+        "Один раз и всё 🤫",
+        "Назад дороги нет.",
+        "Голос засчитан.\nБез переигровок.",
+        "Второй шанс? Не в этой игре 😈",
+        "Решил — живи с этим.",
+        "Поздно менять сторону.",
+        "Ты уже отметился.",
+        "Выбор сделан.",
+    ])
+
+
+def next_ack_phrase() -> str:
+    return random.choice([
+        "Продолжаем 😈",
+        "Ещё раунд? Люблю это.",
+        "Не устали ещё?",
+        "Поехали дальше.",
+        "Становится интересно.",
+        "Не тормозим.",
+        "Я наблюдаю 👀",
+        "Разогнались.",
+        "Хочу ещё.",
+        "Сейчас будет лучше.",
+    ])
 
 
 # =========================
@@ -296,29 +402,81 @@ def get_host(gs: GameState) -> Optional[int]:
 
 
 # =========================
-# RESULT TEXT HELPERS
+# RESULT HELPERS
 # =========================
 def reaction_for_result(items: List[Tuple[int, int]], total_votes: int) -> str:
     if total_votes <= 0 or not items:
-        return "Слишком тихо… даже подозрительно 🤨"
+        return random.choice([
+            "Слишком мирно.\nМне не нравится 😏",
+            "Подозрительно тихо.",
+            "Так не бывает.",
+            "Никто никого? Серьёзно?",
+            "Это был самый дипломатичный раунд.",
+            "Ноль конфликта.\nОпасно.",
+            "Я ожидал большего 😈",
+            "Слишком много культуры.",
+            "Ладно, записал.",
+            "Это было слишком спокойно.",
+        ])
 
     top = items[0][1]
     second = items[1][1] if len(items) > 1 else 0
+    top_count = sum(1 for _, c in items if c == top)
 
     if top == total_votes:
-        return "Единогласно. Тут даже обсуждать нечего 😈"
+        return random.choice([
+            "Единогласно.\nТут даже обсуждать нечего 😈",
+            "Без шансов.\nОчевидно.",
+            "Все договорились заранее?",
+            "Ну это было жёстко 😏",
+            "Группа работает синхронно.",
+            "100% в одного.\nКрасиво, но страшно.",
+            "Ну всё.\nПриговор подписан 😈",
+            "Единодушие.\nЭто редкость.",
+            "Слишком уверенно…",
+            "Даже спорить не с кем.",
+        ])
 
-    top_count = sum(1 for _, c in items if c == top)
     if top_count > 1:
-        return "Мнения разделились. Интересно… 🤫"
+        return random.choice([
+            "Мнения разделились.\nИнтересно 🤫",
+            "Ничья.\nЛюблю драму.",
+            "Компания раскололась.",
+            "Вот это уже живо.",
+            "Слишком тонкий баланс.",
+            "Ровно.\nА теперь обсудите 😏",
+            "Два лагеря.\nКрасота.",
+            "Ничья — лучший повод поругаться (шучу) 🤫",
+            "Никто не победил.\nПока.",
+            "Здесь явно скрытая интрига 😈",
+        ])
 
     if top - second == 1:
-        return "На тоненького. Едва-едва 😏"
+        return random.choice([
+            "На тоненького 😏",
+            "Едва-едва.",
+            "Прямо по краю.",
+            "Минимальный отрыв.\nКрасиво.",
+            "Дышали в спину.",
+            "1 голос решает всё.\nЖизнь.",
+            "Тут было близко.",
+            "Финиш фотофиниш.",
+            "Почти ничья.\nНо нет 😈",
+            "Слишком тонкая грань 🤫",
+        ])
 
-    if top >= max(2, second * 2):
-        return "Похоже, всё очевидно. Запомним 🫠"
-
-    return "Ну… почти договорились 😏"
+    return random.choice([
+        "Похоже, всё очевидно.",
+        "Большинство не сомневалось 😈",
+        "Решение принято.",
+        "Это был уверенный выбор.",
+        "Без лишних вопросов.",
+        "Ну всё.\nВсё ясно.",
+        "Так, записал.\nПродолжаем.",
+        "Жёстко, но честно.",
+        "Вот это уже похоже на правду 😏",
+        "Слишком уверенно получилось 😈",
+    ])
 
 
 def final_top3_text(gs: GameState) -> str:
@@ -331,8 +489,6 @@ def final_top3_text(gs: GameState) -> str:
     lines = [f"Финал 😈", f"Сыграли: {rounds} раунд(ов)\n", "Чаще всего выбирали:"]
     for p in arr[:3]:
         lines.append(f"— {p.label} — {p.score}")
-
-    lines.append("\nЕсли было интересно — добавь меня в другой чат 😉\nЭто между нами 🤫")
     return "\n".join(lines)
 
 
@@ -499,7 +655,7 @@ async def watchdog(chat_id: int):
                 pass
 
         if gs.state != State.IDLE and idle_sec >= SESSION_CLOSE_SEC:
-            await end_game(chat_id, reason="10 минут тишины 😴\nЯ закрываю игру.")
+            await end_game(chat_id, reason=end_phrase_inactive())
             return
 
 
@@ -582,9 +738,7 @@ async def round_timer(chat_id: int, seconds: int):
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
 
-    # ВАЖНО:
-    # - extended_once: мы уже ПРЕДЛОЖИЛИ продлить (показали служебное сообщение)
-    # - extend_used: ведущий уже НАЖАЛ продлить (1 раз)
+    # 1 раз показываем предложение продлить
     if not gs.extended_once and (not_all_voted or gs.total_votes == 0):
         gs.extended_once = True
         touch(gs)
@@ -594,20 +748,12 @@ async def round_timer(chat_id: int, seconds: int):
             return
 
         missing = len(gs.round_voters) - len(gs.voted_users)
-        if gs.total_votes == 0:
-            msg_text = (
-                "Время вышло ⏰\n"
-                "И… никто не проголосовал.\n\n"
-                f"Дадим ещё {EXTEND_SECONDS} секунд?\n"
-                "Только ведущий может продлить 😏"
-            )
-        else:
-            msg_text = (
-                "Время вышло ⏰\n"
-                f"Не все успели проголосовать: ещё {missing} чел.\n\n"
-                f"Продлим на {EXTEND_SECONDS} секунд?\n"
-                "Только ведущий может продлить 😏"
-            )
+        no_votes = (gs.total_votes == 0)
+
+        msg_text = time_up_phrase(missing=missing, no_votes=no_votes) + "\n\n" + (
+            f"Дадим ещё {EXTEND_SECONDS} секунд?\n"
+            "Только ведущий может продлить 😏"
+        )
 
         m = await bot.send_message(chat_id, msg_text, reply_markup=kb_not_all_voted())
         gs.extend_prompt_msg_id = m.message_id
@@ -665,6 +811,12 @@ async def show_round_result(chat_id: int):
                 f"{md_escape(p.label)}, ну что, узнаёшь себя? 😏",
                 f"{md_escape(p.label)}, держись\\. Это только начало 😈",
                 f"{md_escape(p.label)}, ты сегодня в центре внимания 🤫",
+                f"{md_escape(p.label)}, ну привет, звезда этого раунда 😈",
+                f"{md_escape(p.label)}, так-так… объясняйся 😏",
+                f"{md_escape(p.label)}, твоё имя сегодня звучит часто 🤫",
+                f"{md_escape(p.label)}, ты сейчас главный герой 😈",
+                f"{md_escape(p.label)}, я бы на твоём месте напрягся 😏",
+                f"{md_escape(p.label)}, держи удар 😈",
             ]))
         else:
             names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
@@ -695,7 +847,7 @@ async def end_game(chat_id: int, reason: str = ""):
     if gs.watchdog_task and not gs.watchdog_task.done():
         gs.watchdog_task.cancel()
 
-    # подчистим служебное "продлим?", если осталось
+    # подчистим служебное "продлим?"
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
@@ -703,9 +855,13 @@ async def end_game(chat_id: int, reason: str = ""):
             pass
         gs.extend_prompt_msg_id = None
 
-    text = final_top3_text(gs)
+    base = final_top3_text(gs)
+    tail = end_phrase_normal()
+
     if reason:
-        text = reason + "\n\n" + text
+        text = f"{reason}\n\n{base}\n\n{tail}"
+    else:
+        text = f"{base}\n\n{tail}"
 
     GAMES.pop(chat_id, None)
     await bot.send_message(chat_id, text)
@@ -750,7 +906,7 @@ async def cmd_reset(message: Message):
 
 
 # =========================
-# START LOBBY (text trigger)
+# START LOBBY
 # =========================
 @dp.message(F.text.casefold() == "начать игру")
 async def start_lobby(message: Message):
@@ -801,9 +957,9 @@ async def cb_cancel(cb: CallbackQuery):
 
     await cb.answer("Ок")
     try:
-        await cb.message.edit_text("Ок, отменил. Это между нами 🤫")
+        await cb.message.edit_text(cancel_phrase())
     except Exception:
-        await cb.message.answer("Ок, отменил. Это между нами 🤫")
+        await cb.message.answer(cancel_phrase())
 
 
 @dp.callback_query(F.data == "join")
@@ -899,7 +1055,7 @@ async def cb_vote(cb: CallbackQuery):
         return
 
     if voter_id in gs.voted_users:
-        await cb.answer("Ты уже проголосовал(а) 😏", show_alert=False)
+        await cb.answer(already_voted_phrase(), show_alert=False)
         return
 
     try:
@@ -932,9 +1088,7 @@ async def cb_vote(cb: CallbackQuery):
         await show_round_result(chat_id)
 
 
-# =========================
-# EXTEND: только ведущий, удаляем служебное сообщение, голосование остаётся на прошлом сообщении
-# =========================
+# EXTEND: только ведущий, удаляем служебное сообщение, голосование остаётся на старом
 @dp.callback_query(F.data == "extend")
 async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
@@ -954,7 +1108,6 @@ async def cb_extend(cb: CallbackQuery):
 
     if gs.extend_used:
         await cb.answer("Уже продлили 😏", show_alert=False)
-        # попробуем убрать служебку
         try:
             await cb.message.delete()
         except Exception:
@@ -973,7 +1126,6 @@ async def cb_extend(cb: CallbackQuery):
         gs.round_timer_task.cancel()
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
-    # удаляем служебное сообщение "продлим?"
     try:
         await cb.message.delete()
     except Exception:
@@ -1029,7 +1181,7 @@ async def cb_next(cb: CallbackQuery):
         await cb.answer("После 5 раундов — выбери: продолжить или пауза 😏", show_alert=False)
         return
 
-    await cb.answer("Дальше", show_alert=False)
+    await cb.answer(next_ack_phrase(), show_alert=False)
     await start_round(chat_id)
 
 
@@ -1047,7 +1199,6 @@ async def cb_pause(cb: CallbackQuery):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    # подчистим служебное "продлим?", если висит
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
