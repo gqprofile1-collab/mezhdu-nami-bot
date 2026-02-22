@@ -170,7 +170,7 @@ class GameState:
     extend_prompt_msg_id: Optional[int] = None
 
     awaiting_next: bool = False
-    ended: bool = False  # <-- важный флаг против "дописал после завершения"
+    ended: bool = False
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
     watchdog_task: Optional[asyncio.Task] = None
@@ -178,8 +178,14 @@ class GameState:
 
     last_next_press_ts: Dict[int, float] = field(default_factory=dict)
 
-    # <-- чтобы не было “двух лобби” и рассинхрона
+    # один lobby message (важно)
     lobby_msg_id: Optional[int] = None
+
+    # сообщение с кнопками голосования текущего раунда (чтобы снять клаву после итога)
+    round_msg_id: Optional[int] = None
+
+    # текущий вопрос (чтобы коммент под него)
+    current_question: str = ""
 
 
 GAMES: Dict[int, GameState] = {}
@@ -345,12 +351,29 @@ def choose_question(gs: GameState) -> Tuple[str, bool, bool]:
 
 
 def get_host(gs: GameState) -> Optional[int]:
+    # если текущий host исчез (вышел/удалён из players) — перевыбираем
+    if gs.host_user_id is not None and gs.host_user_id not in gs.players:
+        gs.host_user_id = None
+
     if gs.host_user_id is not None:
         return gs.host_user_id
-    if gs.join_order:
-        gs.host_user_id = gs.join_order[0]
-        return gs.host_user_id
+
+    # ведущий = первый по join_order, который ещё в players
+    for uid in gs.join_order:
+        if uid in gs.players:
+            gs.host_user_id = uid
+            return uid
+
     return None
+
+
+async def safe_clear_markup(chat_id: int, message_id: Optional[int]):
+    if not message_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+    except Exception:
+        pass
 
 
 # =========================
@@ -364,7 +387,6 @@ DM_WELCOME_VARIANTS = [
     "Мини-реалити в вашем чате:\n*вопрос → голосование → итог*.\nДа, будет неловко 😏",
 ]
 
-# toast: только plain text (Telegram не форматирует)
 ALREADY_VOTED_TOASTS = [
     "Всё, выбор сделан 😏",
     "Один голос — и живи с этим 🤫",
@@ -463,7 +485,6 @@ async def dm_edit_menu(cb: CallbackQuery, text: str, markup):
 def result_comment(question: str, winner_label: str) -> str:
     q = (question or "").lower()
 
-    # 3 варианта под конкретные вопросы (по ключевым словам)
     rules: List[Tuple[List[str], List[str]]] = [
         (["мастер отмазок", "отмаз"], [
             f"{winner_label} — тебя выбрали! Как теперь <b>отмазываться</b> будешь? 😂",
@@ -521,7 +542,6 @@ def result_comment(question: str, winner_label: str) -> str:
         if any(k in q for k in keys):
             return pick(variants)
 
-    # дефолт — 3 варианта
     generic = [
         f"{winner_label} — тебя выбрали. <b>Узнаёшь себя?</b> 😏",
         f"{winner_label}, поздравляю: ты сегодня <b>в центре сюжета</b> 😈",
@@ -581,7 +601,7 @@ def kb_vote(gs: GameState):
         b.adjust(*([cols] * ((len(targets) + cols - 1) // cols)))
 
     b.row()
-    b.button(text="Завершить игру", callback_data="end_req")  # <-- спокойнее
+    b.button(text="Завершить игру", callback_data="end_req")
     b.adjust(1)
     return b.as_markup()
 
@@ -627,10 +647,6 @@ def lobby_text(gs: GameState) -> str:
 
 
 async def lobby_upsert(gs: GameState):
-    """
-    Всегда поддерживаем ОДНО актуальное сообщение лобби.
-    Если редактирование не удалось — создаём новое и запоминаем id.
-    """
     text = lobby_text(gs)
     try:
         if gs.lobby_msg_id:
@@ -654,16 +670,24 @@ async def lobby_upsert(gs: GameState):
 # =========================
 async def cleanup_game(gs: GameState):
     gs.ended = True
+
+    # стоп таймеров
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
     if gs.watchdog_task and not gs.watchdog_task.done():
         gs.watchdog_task.cancel()
+
+    # убираем служебные сообщения/кнопки
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(gs.chat_id, gs.extend_prompt_msg_id)
         except Exception:
             pass
         gs.extend_prompt_msg_id = None
+
+    # "обезоружить" старые кнопки, чтобы не было клик-хаоса
+    await safe_clear_markup(gs.chat_id, gs.round_msg_id)
+    await safe_clear_markup(gs.chat_id, gs.lobby_msg_id)
 
 
 async def reminder_loop():
@@ -713,9 +737,7 @@ async def watchdog(chat_id: int):
     while True:
         await asyncio.sleep(10)
         gs = GAMES.get(chat_id)
-        if not gs:
-            return
-        if gs.ended:
+        if not gs or gs.ended:
             return
 
         idle_sec = (datetime.utcnow() - gs.last_activity).total_seconds()
@@ -764,9 +786,14 @@ async def start_round(chat_id: int):
 
     touch(gs)
 
+    # обезоруживаем прошлые кнопки раунда
+    await safe_clear_markup(chat_id, gs.round_msg_id)
+    gs.round_msg_id = None
+
     gs.awaiting_next = False
     gs.extended_prompted = False
     gs.extend_used = False
+
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
@@ -786,6 +813,7 @@ async def start_round(chat_id: int):
     gs.round_targets = snapshot_ids[:]
 
     q, is_spicy, has_secret = choose_question(gs)
+    gs.current_question = q
 
     q_caps = q.upper()
 
@@ -809,7 +837,8 @@ async def start_round(chat_id: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
+    m = await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
+    gs.round_msg_id = m.message_id
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
@@ -820,7 +849,11 @@ async def round_timer(chat_id: int, seconds: int):
         return
 
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
+    if not gs or gs.state != State.RUNNING or gs.ended:
+        return
+
+    # если итог уже посчитан — молчим
+    if gs.awaiting_next:
         return
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
@@ -846,22 +879,28 @@ async def round_timer(chat_id: int, seconds: int):
 
 async def show_round_result(chat_id: int):
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
+    if not gs or gs.state != State.RUNNING or gs.ended:
         return
 
-    touch(gs)
+    # 🔒 анти-гонка: если уже считаем итог — второй раз не заходим
+    if gs.awaiting_next:
+        return
     gs.awaiting_next = True
+
+    touch(gs)
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    # убираем “продлить?”
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
         except Exception:
             pass
         gs.extend_prompt_msg_id = None
+
+    # убрать кнопки голосования у сообщения раунда
+    await safe_clear_markup(chat_id, gs.round_msg_id)
 
     if gs.total_votes == 0:
         await bot.send_message(
@@ -884,22 +923,20 @@ async def show_round_result(chat_id: int):
         if p:
             lines.append(f"— <b>{h(p.label)}</b>: {c}")
 
-    lines.append("")  # пустая строка
+    lines.append("")
+
+    q_text = gs.current_question or ""
 
     if len(top_all) == 1 and top_uid in gs.players:
         winner = gs.players[top_uid].label
-        # комментарий “под вопрос”
-        # (последний вопрос в тексте не хранится отдельно — поэтому берём по верхнему совпадению из pool:
-        # проще: хранить текущий вопрос в gs? не делали — добавим минимально: вопрос можно достать из last message нельзя.
-        # Поэтому сохраняем вопрос в gs локально:
-        pass  # заменим ниже (см. патч: gs_current_question)
+        lines.append(f"<b>Большинство:</b> {h(winner)}")
+        lines.append(result_comment(q_text, f"<b>{h(winner)}</b>"))
+    else:
+        names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
+        lines.append(f"<b>Ничья:</b> {h(names)}")
+        lines.append("Красиво разошлись. Но я всё равно <b>запомнил</b> 😏")
 
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="HTML")
-
-
-# --- Патч: храним текущий вопрос, чтобы комментарий был “под него” ---
-# Добавляем поле динамически безопасно (Python позволяет), но лучше сделать явно.
-# Сделаем явно через setattr в start_round (ниже).
 
 
 async def end_game(chat_id: int, reason: str = ""):
@@ -1031,7 +1068,9 @@ async def cb_cancel(cb: CallbackQuery):
 async def cb_join(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.LOBBY or gs.ended:
+
+    # join можно и в RUNNING (вступит со следующего раунда)
+    if not gs or gs.ended or gs.state not in (State.LOBBY, State.RUNNING):
         await cb.answer("Лобби закрыто. Напиши «Начать игру».", show_alert=True)
         return
 
@@ -1043,9 +1082,9 @@ async def cb_join(cb: CallbackQuery):
 
     uid = cb.from_user.id
     if uid in gs.players:
-        # важно: список мог не обновиться визуально -> мы его обновим принудительно
         await cb.answer("Ты уже в игре 😏")
-        await lobby_upsert(gs)
+        if gs.state == State.LOBBY:
+            await lobby_upsert(gs)
         return
 
     if len(gs.players) >= MAX_PLAYERS:
@@ -1055,6 +1094,10 @@ async def cb_join(cb: CallbackQuery):
     label = make_label(gs, cb.from_user)
     gs.players[uid] = Player(user_id=uid, label=label)
     gs.join_order.append(uid)
+
+    if gs.state == State.RUNNING:
+        await cb.answer("Ок ✅ Со следующего раунда ты в деле 😈")
+        return
 
     await cb.answer("Записал ✅")
     await lobby_upsert(gs)
@@ -1084,6 +1127,10 @@ async def cb_start(cb: CallbackQuery):
     stats_inc("games_started", 1)
 
     await cb.answer("Погнали 😈")
+
+    # гасим кнопки лобби, чтобы не жали в старое
+    await safe_clear_markup(chat_id, gs.lobby_msg_id)
+
     await start_round(chat_id)
 
 
@@ -1168,7 +1215,6 @@ async def cb_extend(cb: CallbackQuery):
         gs.round_timer_task.cancel()
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
-    # удаляем служебку “продлить?”
     try:
         await cb.message.delete()
     except Exception:
@@ -1232,7 +1278,6 @@ async def cb_end_req(cb: CallbackQuery):
     try:
         await cb.message.edit_reply_markup(reply_markup=kb_end_confirm())
     except Exception:
-        # если нельзя редактировать — шлём отдельное подтверждение
         await bot.send_message(
             cb.message.chat.id,
             "Точно <b>завершить игру</b>?",
@@ -1247,8 +1292,6 @@ async def cb_end_no(cb: CallbackQuery):
     gs = GAMES.get(cb.message.chat.id)
     if not gs or gs.ended:
         return
-    # возвращаем нормальную клаву в зависимости от контекста:
-    # проще: вернуть "результатную", она подходит везде
     try:
         await cb.message.edit_reply_markup(reply_markup=kb_result())
     except Exception:
@@ -1425,131 +1468,6 @@ async def successful_payment(message: Message):
         "Мы это превратим в <b>ещё более колкие вопросы</b> 😈",
         parse_mode="HTML",
     )
-
-
-# =========================
-# PATCH: store current question & use comment
-# =========================
-# Мы делаем это так, чтобы не ломать dataclass: просто используем атрибут gs.current_question.
-
-async def show_round_result(chat_id: int):
-    gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.awaiting_next or gs.ended:
-        return
-
-    touch(gs)
-    gs.awaiting_next = True
-
-    if gs.round_timer_task and not gs.round_timer_task.done():
-        gs.round_timer_task.cancel()
-
-    if gs.extend_prompt_msg_id:
-        try:
-            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
-        except Exception:
-            pass
-        gs.extend_prompt_msg_id = None
-
-    if gs.total_votes == 0:
-        await bot.send_message(
-            chat_id,
-            f"<b>ИТОГ РАУНДА {gs.round}:</b>\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
-            reply_markup=kb_result(),
-            parse_mode="HTML",
-        )
-        return
-
-    items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
-    top_uid, top_count = items[0]
-    top_all = [uid for uid, c in items if c == top_count]
-
-    lines = [f"<b>ИТОГ РАУНДА {gs.round}:</b>"]
-    for uid, c in items:
-        if c <= 0:
-            continue
-        p = gs.players.get(uid)
-        if p:
-            lines.append(f"— <b>{h(p.label)}</b>: {c}")
-
-    lines.append("")
-
-    q_text = getattr(gs, "current_question", "") or ""
-    if len(top_all) == 1 and top_uid in gs.players:
-        winner = gs.players[top_uid].label
-        lines.append(f"<b>Большинство:</b> {h(winner)}")
-        lines.append(result_comment(q_text, f"<b>{h(winner)}</b>"))
-    else:
-        names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
-        lines.append(f"<b>Ничья:</b> {h(names)}")
-        lines.append("Красиво разошлись. Но я всё равно <b>запомнил</b> 😏")
-
-    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="HTML")
-
-
-async def start_round(chat_id: int):
-    gs = GAMES.get(chat_id)
-    if not gs or gs.state != State.RUNNING or gs.ended:
-        return
-
-    if len(gs.players) < MIN_PLAYERS:
-        await bot.send_message(
-            chat_id,
-            "Для игры нужно <b>минимум двое</b>.\nВсе разошлись? Я тоже 😏",
-            parse_mode="HTML",
-        )
-        await end_game(chat_id)
-        return
-
-    touch(gs)
-
-    gs.awaiting_next = False
-    gs.extended_prompted = False
-    gs.extend_used = False
-    if gs.extend_prompt_msg_id:
-        try:
-            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
-        except Exception:
-            pass
-        gs.extend_prompt_msg_id = None
-
-    gs.round += 1
-    stats_inc("rounds_played", 1)
-
-    gs.votes_by_target.clear()
-    gs.voted_users.clear()
-    gs.total_votes = 0
-
-    snapshot_ids = [uid for uid in gs.join_order if uid in gs.players]
-    gs.round_voters = set(snapshot_ids)
-    gs.round_targets = snapshot_ids[:]
-
-    q, is_spicy, has_secret = choose_question(gs)
-    setattr(gs, "current_question", q)  # <-- сохраняем вопрос
-
-    q_caps = q.upper()
-
-    tags = []
-    if has_secret:
-        tags.append("Только честно 🤫")
-    if is_spicy:
-        tags.append("Отвечайте честно 😈")
-
-    tag_line = f"\n\n<i>{h(' · '.join(tags))}</i>" if tags else ""
-    timer_line = f"\n\n<i>({ROUND_VOTE_SECONDS} сек на голосование)</i>"
-
-    text = (
-        f"<b>РАУНД {gs.round} 😈</b>\n\n"
-        f"<b>{h(q_caps)}</b>"
-        f"{tag_line}"
-        f"{timer_line}\n\n"
-        f"<b>Голосуйте</b> 👇"
-    )
-
-    if gs.round_timer_task and not gs.round_timer_task.done():
-        gs.round_timer_task.cancel()
-
-    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="HTML")
-    gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
 # =========================
