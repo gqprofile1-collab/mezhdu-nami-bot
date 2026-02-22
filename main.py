@@ -11,7 +11,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -22,11 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения (Railway Variables).")
 
-# ВАЖНО: укажи юзернейм бота (без @), чтобы работала кнопка "Добавить в чат" в личке
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
-if not BOT_USERNAME:
-    # можно оставить пустым и прописать константой, но лучше через Railway Variables
-    raise RuntimeError("BOT_USERNAME не задан (например: mezhdu_nami_bot). Добавь в переменные окружения.")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # можно пустым
 
 MAX_PLAYERS = 10
 MIN_PLAYERS = 2
@@ -34,18 +30,17 @@ MIN_PLAYERS = 2
 ROUND_VOTE_SECONDS = 15
 EXTEND_SECONDS = 15
 
-# ТЗ: 5 минут → закрыть лобби, 10 минут → закрыть сессию
 LOBBY_CLOSE_SEC = 5 * 60
 SESSION_CLOSE_SEC = 10 * 60
 
 NEXT_COOLDOWN_SEC = 1.0
 
 # =========================
-# REMINDERS
+# REMINDERS + META STORE
 # =========================
 CHATS_STORE_PATH = "chats.json"
-REMIND_EVERY_SEC = 3 * 24 * 60 * 60   # 3 дня
-REMIND_CHECK_SEC = 60 * 60            # проверка раз в час
+REMIND_EVERY_SEC = 3 * 24 * 60 * 60
+REMIND_CHECK_SEC = 60 * 60
 
 
 # =========================
@@ -145,7 +140,6 @@ class GameState:
     used_normal: Set[int] = field(default_factory=set)
     used_spicy: Set[int] = field(default_factory=set)
 
-    # острые каждые 3–4; фирменная вставка каждые 4–5
     since_last_spicy: int = 0
     next_spicy_at: int = field(default_factory=lambda: random.randint(3, 4))
 
@@ -156,7 +150,6 @@ class GameState:
     current_is_spicy: bool = False
     current_has_secret: bool = False
 
-    # snapshot на раунд
     round_targets: List[int] = field(default_factory=list)
     round_voters: Set[int] = field(default_factory=set)
 
@@ -164,15 +157,14 @@ class GameState:
     voted_users: Set[int] = field(default_factory=set)
     total_votes: int = 0
 
-    # таймеры/защита
+    # продление
     extended_once: bool = False          # показали предложение продлить
     extend_used: bool = False            # ведущий реально продлил (1 раз)
     awaiting_next: bool = False
     pause_gate: bool = False
 
-    # IDs сообщений
-    current_vote_msg_id: Optional[int] = None     # сообщение с кнопками игроков (голосовалка)
-    extend_prompt_msg_id: Optional[int] = None    # служебное сообщение "продлим?"
+    # служебка
+    extend_prompt_msg_id: Optional[int] = None
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
     watchdog_task: Optional[asyncio.Task] = None
@@ -206,113 +198,7 @@ def md_bold_caps(text: str) -> str:
 
 
 # =========================
-# PHRASES (10 variants)
-# =========================
-def end_phrase_normal() -> str:
-    return random.choice([
-        "Было опасно весело 😈\nВозвращайтесь. Я люблю наблюдать.",
-        "Ну всё 🤫\nКомпания интересная. Запомним.",
-        "Это было неловко… и прекрасно 😏\nЗалетайте ещё.",
-        "Хорошо разогрелись.\nВ следующий раз будет жарче 😈",
-        "Вы вообще понимаете, что тут происходило? 😏\nПродолжим потом.",
-        "Никто не поссорился — удивительно 🫠\nЗначит, ещё сыграем.",
-        "Атмосфера была подозрительно приятной 😈\nМне нравится.",
-        "Я всё записал.\nНо это между нами 🤫",
-        "Ну что… вы справились.\nНо можно и лучше 😏",
-        "Добавите меня в другой чат?\nИнтересно, кто там самый опасный 😈",
-    ])
-
-
-def end_phrase_inactive() -> str:
-    return random.choice([
-        "10 минут тишины… я понял 🫠\nЗакрываю игру.\n\nВернётесь — продолжим.",
-        "Чат ушёл в спячку 😴\nЯ закрываю игру.\n\nНо я не обижаюсь.",
-        "Тишина подозрительная 🤨\nЗакрываю сессию.\n\nЭто было красиво.",
-        "Похоже, кто-то испугался результатов 😏\nЗакрываю игру.",
-        "Ладно.\nПусть интрига повисит в воздухе 🤫",
-        "Я подожду в тени.\nНо игру закрываю 😈",
-        "Вы резко стали тихими… интересно почему 🫠\nЗакрываю.",
-        "Энергия ушла.\nНо атмосфера осталась 😏",
-        "Оставим это как незавершённый диалог 🤫",
-        "Я закрою игру.\nНо мы ещё не договорили 😈",
-    ])
-
-
-def cancel_phrase() -> str:
-    return random.choice([
-        "Ок. Отменяем 😏\nИнтрига остаётся.",
-        "Передумали? Интересно 🤫",
-        "Ладно.\nВ этот раз без разоблачений 😈",
-        "Сбросили.\nНо я всё видел.",
-        "Отмена принята.\nСлишком горячо стало?",
-        "Ну всё.\nРазошлись красиво.",
-        "Иногда лучше остановиться 😏",
-        "Ок.\nНо я ожидал продолжения.",
-        "Спаслись 😈\nПока.",
-        "Сценарий переписан.\nПопробуем снова?",
-    ])
-
-
-def time_up_phrase(missing: int, no_votes: bool) -> str:
-    if no_votes:
-        return random.choice([
-            "Время вышло ⏰\nИ… никто не рискнул 😏",
-            "15 секунд прошло.\nТишина.\nИнтересно 🤫",
-            "Никто не нажал.\nБоимся?",
-            "Подозрительная пауза… 🫠",
-            "Так тихо стало.\nМне даже неловко.",
-            "Вы там живы? 😈\nПока что никто не голосовал.",
-            "Слишком мирно.\nТак не бывает.",
-            "Ноль голосов.\nЗапомним этот момент.",
-            "Тишина на весь чат.\nКрасиво, но странно.",
-            "Никто никого.\nЯ в шоке 😏",
-        ])
-    return random.choice([
-        f"Время вышло ⏰\nЕщё {missing} человек молчат…",
-        f"{missing} всё ещё думают 😏",
-        f"Кто-то тянет драму.\nЕщё {missing} без голоса.",
-        f"Не все готовы признаться 😈\nОсталось: {missing}",
-        f"Ожидание затянулось.\nЕщё {missing} не нажали.",
-        f"{missing} человек держат паузу.\nСильный ход 🤫",
-        f"Время. А молчуны ещё тут: {missing}.",
-        f"Ещё {missing} и можно делать выводы 😏",
-        f"{missing} не проголосовали.\nЯ вижу всё 👀",
-        f"Почти все успели.\nНо {missing} решили исчезнуть 😈",
-    ])
-
-
-def already_voted_phrase() -> str:
-    return random.choice([
-        "Ты уже сделал выбор 😏",
-        "Повторно нельзя.\nРешения — это серьёзно.",
-        "Один раз и всё 🤫",
-        "Назад дороги нет.",
-        "Голос засчитан.\nБез переигровок.",
-        "Второй шанс? Не в этой игре 😈",
-        "Решил — живи с этим.",
-        "Поздно менять сторону.",
-        "Ты уже отметился.",
-        "Выбор сделан.",
-    ])
-
-
-def next_ack_phrase() -> str:
-    return random.choice([
-        "Продолжаем 😈",
-        "Ещё раунд? Люблю это.",
-        "Не устали ещё?",
-        "Поехали дальше.",
-        "Становится интересно.",
-        "Не тормозим.",
-        "Я наблюдаю 👀",
-        "Разогнались.",
-        "Хочу ещё.",
-        "Сейчас будет лучше.",
-    ])
-
-
-# =========================
-# REMINDERS store
+# STORE helpers (chats.json)
 # =========================
 def _load_chats_store() -> Dict[str, Dict]:
     p = Path(CHATS_STORE_PATH)
@@ -340,64 +226,131 @@ def mark_chat_started(chat_id: int) -> None:
     _save_chats_store(data)
 
 
-async def reminder_loop():
-    while True:
-        try:
-            await asyncio.sleep(REMIND_CHECK_SEC)
-            data = _load_chats_store()
-            now = int(time.time())
+def mark_group_welcome_sent(chat_id: int) -> None:
+    data = _load_chats_store()
+    key = str(chat_id)
+    now = int(time.time())
+    meta = data.get(key, {})
+    meta["welcome_sent_ts"] = now
+    data[key] = meta
+    _save_chats_store(data)
 
-            for key, meta in list(data.items()):
-                try:
-                    chat_id = int(key)
-                except Exception:
-                    continue
 
-                last_started = int(meta.get("last_started_ts", 0))
-                last_reminded = int(meta.get("last_reminded_ts", 0))
+def was_group_welcome_sent(chat_id: int) -> bool:
+    data = _load_chats_store()
+    meta = data.get(str(chat_id), {})
+    return int(meta.get("welcome_sent_ts", 0)) > 0
 
-                if last_started <= 0:
-                    continue
 
-                if now - last_started < REMIND_EVERY_SEC:
-                    continue
+# =========================
+# PHRASES (коротко, но дерзко)
+# =========================
+def dm_welcome_text() -> str:
+    return (
+        "Привет 😏\n\n"
+        "Я — *«Между нами 🤫»*.\n"
+        "Игра для компаний: вопрос → голосование → итог → следующий.\n\n"
+        "Как запустить:\n"
+        "1) Добавь меня в группу\n"
+        "2) В группе напиши: *Начать игру*\n\n"
+        "/help — правила\n"
+        "Я не осуждаю.\nЯ запоминаю 😈"
+    )
 
-                if last_reminded >= last_started:
-                    continue
 
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        "Эй 😏\n"
-                        "Три дня тишины…\n"
-                        "Может, сыграем снова в «Между нами 🤫»?\n\n"
-                        "Напишите: «Начать игру» 👇",
-                    )
-                    meta["last_reminded_ts"] = now
-                    data[key] = meta
-                except Exception:
-                    continue
+def group_welcome_text() -> str:
+    return (
+        "Я тут 😏\n"
+        "Это *«Между нами 🤫»*.\n\n"
+        "Чтобы начать — напишите:\n"
+        "*Начать игру* 😈\n\n"
+        "/help — правила\n"
+        "Дальше будет неловко. И весело."
+    )
 
-            _save_chats_store(data)
 
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            continue
+def already_voted_phrase() -> str:
+    return random.choice([
+        "Ты уже сделал выбор 😏",
+        "Один раз и всё 🤫",
+        "Поздно менять сторону 😈",
+        "Решил — живи с этим.",
+        "Голос уже улетел. Обратно нельзя.",
+        "Без переигровок 😏",
+        "Ты уже отметился.",
+        "Назад дороги нет.",
+        "Выбор сделан.",
+        "Второй шанс? Не сегодня 😈",
+    ])
+
+
+def time_up_phrase(missing: int, no_votes: bool) -> str:
+    if no_votes:
+        return random.choice([
+            "Время вышло ⏰\nИ… никто не рискнул 😏",
+            "Тишина.\nПодозрительно 🤫",
+            "Ноль голосов.\nТак не бывает 😈",
+            "Никто не нажал.\nБоимся?",
+            "Слишком мирно.\nМне не нравится 😏",
+        ])
+    return random.choice([
+        f"Время вышло ⏰\nЕщё {missing} человек молчат…",
+        f"{missing} всё ещё думают 😏",
+        f"Кто-то тянет драму.\nЕщё {missing} без голоса.",
+        f"Ещё {missing} и можно делать выводы 😈",
+        f"{missing} не нажали.\nЯ вижу всё 👀",
+    ])
+
+
+def next_ack_phrase() -> str:
+    return random.choice([
+        "Продолжаем 😈",
+        "Поехали дальше.",
+        "Ещё раунд? Люблю это 😏",
+        "Не тормозим.",
+        "Сейчас будет лучше 😈",
+    ])
+
+
+def end_phrase_normal() -> str:
+    return random.choice([
+        "Было опасно весело 😈\nВозвращайтесь.",
+        "Ну всё 🤫\nСпасибо за игру. Продолжим потом.",
+        "Это было неловко… и прекрасно 😏",
+        "Я всё записал.\nНо это между нами 🤫",
+        "Захотите ещё — просто «Начать игру» 😈",
+    ])
+
+
+def end_phrase_inactive() -> str:
+    return random.choice([
+        "10 минут тишины… я понял 🫠\nЗакрываю игру.\nВернётесь — продолжим 😈",
+        "Чат ушёл в спячку 😴\nЯ закрываю игру.\nНо я рядом 😏",
+        "Тишина слишком громкая 🤫\nЗакрываю сессию.",
+        "Похоже, кто-то испугался итогов 😏\nЗакрываю.",
+        "Я подожду.\nНо игру закрываю 😈",
+    ])
+
+
+def cancel_phrase() -> str:
+    return random.choice([
+        "Ок. Отменяем 😏\nИнтрига остаётся.",
+        "Передумали? Интересно 🤫",
+        "Ладно.\nВ этот раз без разоблачений 😈",
+        "Сбросили.\nНо я всё видел.",
+        "Ну всё.\nРазошлись красиво 😏",
+    ])
 
 
 # =========================
 # KEYBOARDS
 # =========================
 def kb_add_to_group():
-    """
-    Кнопка в личке: "Добавить в чат"
-    Работает через deep link startgroup.
-    """
     b = InlineKeyboardBuilder()
-    b.button(text="➕ Добавить в чат", url=f"https://t.me/{BOT_USERNAME}?startgroup=1")
+    if BOT_USERNAME:
+        b.button(text="➕ Добавить в группу", url=f"https://t.me/{BOT_USERNAME}?startgroup=1")
     b.button(text="📌 Как играть", callback_data="howto_dm")
-    b.adjust(1, 1)
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -454,8 +407,8 @@ def kb_paused():
 
 def kb_not_all_voted():
     b = InlineKeyboardBuilder()
-    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")  # только ведущий (проверка в handler)
-    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")   # только ведущий (проверка в handler)
+    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")  # только ведущий
+    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")   # только ведущий
     b.button(text="🛑 Завершить", callback_data="end")
     b.adjust(1, 1, 1)
     return b.as_markup()
@@ -558,94 +511,49 @@ def get_host(gs: GameState) -> Optional[int]:
 
 
 # =========================
-# RESULT HELPERS
+# REMINDERS loop
 # =========================
-def reaction_for_result(items: List[Tuple[int, int]], total_votes: int) -> str:
-    if total_votes <= 0 or not items:
-        return random.choice([
-            "Слишком мирно.\nМне не нравится 😏",
-            "Подозрительно тихо.",
-            "Так не бывает.",
-            "Никто никого? Серьёзно?",
-            "Это был самый дипломатичный раунд.",
-            "Ноль конфликта.\nОпасно.",
-            "Я ожидал большего 😈",
-            "Слишком много культуры.",
-            "Ладно, записал.",
-            "Это было слишком спокойно.",
-        ])
+async def reminder_loop():
+    while True:
+        try:
+            await asyncio.sleep(REMIND_CHECK_SEC)
+            data = _load_chats_store()
+            now = int(time.time())
 
-    top = items[0][1]
-    second = items[1][1] if len(items) > 1 else 0
-    top_count = sum(1 for _, c in items if c == top)
+            for key, meta in list(data.items()):
+                try:
+                    chat_id = int(key)
+                except Exception:
+                    continue
 
-    if top == total_votes:
-        return random.choice([
-            "Единогласно.\nТут даже обсуждать нечего 😈",
-            "Без шансов.\nОчевидно.",
-            "Все договорились заранее?",
-            "Ну это было жёстко 😏",
-            "Группа работает синхронно.",
-            "100% в одного.\nКрасиво, но страшно.",
-            "Ну всё.\nПриговор подписан 😈",
-            "Единодушие.\nЭто редкость.",
-            "Слишком уверенно…",
-            "Даже спорить не с кем.",
-        ])
+                last_started = int(meta.get("last_started_ts", 0))
+                last_reminded = int(meta.get("last_reminded_ts", 0))
 
-    if top_count > 1:
-        return random.choice([
-            "Мнения разделились.\nИнтересно 🤫",
-            "Ничья.\nЛюблю драму.",
-            "Компания раскололась.",
-            "Вот это уже живо.",
-            "Слишком тонкий баланс.",
-            "Ровно.\nА теперь обсудите 😏",
-            "Два лагеря.\nКрасота.",
-            "Ничья — лучший повод поругаться (шучу) 🤫",
-            "Никто не победил.\nПока.",
-            "Здесь явно скрытая интрига 😈",
-        ])
+                if last_started <= 0:
+                    continue
+                if now - last_started < REMIND_EVERY_SEC:
+                    continue
+                if last_reminded >= last_started:
+                    continue
 
-    if top - second == 1:
-        return random.choice([
-            "На тоненького 😏",
-            "Едва-едва.",
-            "Прямо по краю.",
-            "Минимальный отрыв.\nКрасиво.",
-            "Дышали в спину.",
-            "1 голос решает всё.\nЖизнь.",
-            "Тут было близко.",
-            "Финиш фотофиниш.",
-            "Почти ничья.\nНо нет 😈",
-            "Слишком тонкая грань 🤫",
-        ])
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "Эй 😏\n"
+                        "Три дня тишины…\n"
+                        "Может, сыграем снова в «Между нами 🤫»?\n\n"
+                        "Напишите: «Начать игру» 👇",
+                    )
+                    meta["last_reminded_ts"] = now
+                    data[key] = meta
+                except Exception:
+                    continue
 
-    return random.choice([
-        "Похоже, всё очевидно.",
-        "Большинство не сомневалось 😈",
-        "Решение принято.",
-        "Это был уверенный выбор.",
-        "Без лишних вопросов.",
-        "Ну всё.\nВсё ясно.",
-        "Так, записал.\nПродолжаем.",
-        "Жёстко, но честно.",
-        "Вот это уже похоже на правду 😏",
-        "Слишком уверенно получилось 😈",
-    ])
-
-
-def final_top3_text(gs: GameState) -> str:
-    if not gs.players:
-        return "Игра окончена. Никого не осталось 🤷‍♂️"
-
-    arr = sorted(gs.players.values(), key=lambda p: p.score, reverse=True)
-    rounds = gs.round
-
-    lines = [f"Финал 😈", f"Сыграли: {rounds} раунд(ов)\n", "Чаще всего выбирали:"]
-    for p in arr[:3]:
-        lines.append(f"— {p.label} — {p.score}")
-    return "\n".join(lines)
+            _save_chats_store(data)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            continue
 
 
 # =========================
@@ -701,7 +609,6 @@ async def start_round(chat_id: int):
     gs.awaiting_next = False
     gs.pause_gate = False
 
-    # сбрасываем продления/служебные сообщения на раунд
     gs.extended_once = False
     gs.extend_used = False
     gs.extend_prompt_msg_id = None
@@ -737,9 +644,7 @@ async def start_round(chat_id: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    msg = await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="MarkdownV2")
-    gs.current_vote_msg_id = msg.message_id
-
+    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="MarkdownV2")
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
@@ -798,49 +703,39 @@ async def show_round_result(chat_id: int):
         gs.extend_prompt_msg_id = None
 
     if gs.total_votes == 0:
-        text = (
-            f"Итог раунда {gs.round}:\n"
-            "Никого не выбрали.\n"
-            "Слишком мирно… подозрительно 🤨"
+        await bot.send_message(
+            chat_id,
+            f"Итог раунда {gs.round}:\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
+            reply_markup=kb_result(),
         )
-        await bot.send_message(chat_id, text, reply_markup=kb_result())
+        return
+
+    items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
+    lines: List[str] = [f"Итог раунда {gs.round}:"]
+
+    for uid, c in items:
+        p = gs.players.get(uid)
+        if p and c > 0:
+            lines.append(f"{md_bold(p.label)} — {c}")
+
+    top_uid, top_count = items[0]
+    top_all = [uid for uid, c in items if c == top_count]
+
+    lines.append("")
+    if len(top_all) == 1 and top_uid in gs.players:
+        p = gs.players[top_uid]
+        lines.append(f"Большинство: {md_bold(p.label)}")
+        lines.append(md_escape(random.choice([
+            f"{p.label}, есть комментарий? 🙂",
+            f"{p.label}, узнаёшь себя? 😏",
+            f"{p.label}, держись\\. Это только начало 😈",
+            f"{p.label}, сегодня ты в центре внимания 🤫",
+        ])))
     else:
-        items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
+        names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
+        lines.append(f"Ничья: {md_bold(names)}")
 
-        lines: List[str] = [f"Итог раунда {gs.round}:"]
-
-        for uid, c in items:
-            p = gs.players.get(uid)
-            if p and c > 0:
-                lines.append(f"{md_bold(p.label)} — {c}")
-
-        top_uid, top_count = items[0]
-        top_all = [uid for uid, c in items if c == top_count]
-
-        lines.append("")
-
-        if len(top_all) == 1 and top_uid in gs.players:
-            p = gs.players[top_uid]
-            lines.append(f"Большинство: {md_bold(p.label)}")
-            lines.append(random.choice([
-                f"{md_escape(p.label)}, есть комментарий? 🙂",
-                f"{md_escape(p.label)}, ну что, узнаёшь себя? 😏",
-                f"{md_escape(p.label)}, держись\\. Это только начало 😈",
-                f"{md_escape(p.label)}, ты сегодня в центре внимания 🤫",
-                f"{md_escape(p.label)}, ну привет, звезда этого раунда 😈",
-                f"{md_escape(p.label)}, так-так… объясняйся 😏",
-                f"{md_escape(p.label)}, твоё имя сегодня звучит часто 🤫",
-                f"{md_escape(p.label)}, ты сейчас главный герой 😈",
-                f"{md_escape(p.label)}, я бы на твоём месте напрягся 😏",
-                f"{md_escape(p.label)}, держи удар 😈",
-            ]))
-        else:
-            names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
-            lines.append(f"Ничья: {md_bold(names)}")
-
-        lines.append(md_escape(reaction_for_result(items, gs.total_votes)))
-
-        await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="MarkdownV2")
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(), parse_mode="MarkdownV2")
 
     if gs.round % 5 == 0:
         gs.pause_gate = True
@@ -870,56 +765,46 @@ async def end_game(chat_id: int, reason: str = ""):
             pass
         gs.extend_prompt_msg_id = None
 
-    base = final_top3_text(gs)
-    tail = end_phrase_normal()
-
-    if reason:
-        text = f"{reason}\n\n{base}\n\n{tail}"
+    # финал
+    if not gs.players:
+        base = "Игра окончена. Никого не осталось 🤷‍♂️"
     else:
-        text = f"{base}\n\n{tail}"
+        arr = sorted(gs.players.values(), key=lambda p: p.score, reverse=True)
+        lines = [f"Финал 😈", f"Сыграли: {gs.round} раунд(ов)\n", "Чаще всего выбирали:"]
+        for p in arr[:3]:
+            lines.append(f"— {p.label} — {p.score}")
+        base = "\n".join(lines)
+
+    tail = end_phrase_normal()
+    text = f"{reason}\n\n{base}\n\n{tail}" if reason else f"{base}\n\n{tail}"
 
     GAMES.pop(chat_id, None)
     await bot.send_message(chat_id, text)
 
 
 # =========================
-# COMMANDS & DM UX
+# DM /start (ВАЖНО: это то, что ты просил)
 # =========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # В личке даём кнопку "Добавить в чат"
+    # В ЛИЧКЕ: всегда приветствие + кнопка "Добавить в группу"
     if message.chat.type == "private":
-        await message.answer(
-            "Между нами 🤫\n\n"
-            "Я создан для *чатов*.\n"
-            "Нажми кнопку ниже — добавь меня в группу.\n\n"
-            "А потом в группе напиши:\n"
-            "*Начать игру* 😈",
-            reply_markup=kb_add_to_group(),
-            parse_mode="Markdown",
-        )
+        await message.answer(dm_welcome_text(), reply_markup=kb_add_to_group(), parse_mode="Markdown")
         return
 
-    # В группе — обычная инструкция
-    await message.answer(
-        "Между нами 🤫\n\n"
-        "Напишите в этом чате:\n"
-        "«Начать игру» 😈\n\n"
-        "/help — правила"
-    )
+    # В ГРУППЕ: нейтрально
+    await message.answer("Я тут 😏\nНапишите: «Начать игру»\n\n/help — правила")
 
 
 @dp.callback_query(F.data == "howto_dm")
 async def cb_howto_dm(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer(
-        "Как играть:\n"
-        "1) Добавь меня в *группу*\n"
-        "2) Напиши: *Начать игру*\n"
-        "3) Все жмут: *Присоединиться*\n"
-        "4) Создатель жмёт: *Ну что? Погнали?*\n"
-        "5) 15 секунд на голосование → результат → следующий 😈\n\n"
-        "Я не кусаюсь.\nЯ просто запоминаю 🤫",
+        "Коротко:\n"
+        "1) Добавь меня в группу\n"
+        "2) В группе напиши: *Начать игру*\n"
+        "3) Жмите «Присоединиться» и погнали 😈\n\n"
+        "Подсказка: ведущий — тот, кто начал игру.",
         parse_mode="Markdown",
     )
 
@@ -939,15 +824,6 @@ async def cmd_help(message: Message):
     )
 
 
-@dp.message(Command("reset"))
-async def cmd_reset(message: Message):
-    chat_id = message.chat.id
-    if chat_id not in GAMES:
-        await message.answer("Игры сейчас нет 😏")
-        return
-    await end_game(chat_id, reason="Ок. Сбросил игру 🧹\nМожно начинать заново: «Начать игру»")
-
-
 # =========================
 # START LOBBY
 # =========================
@@ -957,7 +833,7 @@ async def start_lobby(message: Message):
     gs = GAMES.get(chat_id)
 
     if gs and gs.state in {State.LOBBY, State.RUNNING, State.PAUSED}:
-        await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.\n\nЕсли всё зависло — /reset")
+        await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.")
         return
 
     gs = GameState(chat_id=chat_id)
@@ -1131,7 +1007,6 @@ async def cb_vote(cb: CallbackQuery):
         await show_round_result(chat_id)
 
 
-# EXTEND: только ведущий, удаляем служебное сообщение, голосование остаётся на старом
 @dp.callback_query(F.data == "extend")
 async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
@@ -1154,10 +1029,7 @@ async def cb_extend(cb: CallbackQuery):
         try:
             await cb.message.delete()
         except Exception:
-            try:
-                await cb.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+            pass
         gs.extend_prompt_msg_id = None
         return
 
@@ -1169,14 +1041,11 @@ async def cb_extend(cb: CallbackQuery):
         gs.round_timer_task.cancel()
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
+    # удаляем служебку продления — голосование остаётся на прошлом сообщении
     try:
         await cb.message.delete()
     except Exception:
-        try:
-            await cb.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
+        pass
     gs.extend_prompt_msg_id = None
 
 
@@ -1242,13 +1111,6 @@ async def cb_pause(cb: CallbackQuery):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    if gs.extend_prompt_msg_id:
-        try:
-            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
-        except Exception:
-            pass
-        gs.extend_prompt_msg_id = None
-
     await cb.answer("Пауза", show_alert=False)
     try:
         await cb.message.edit_text(
@@ -1292,6 +1154,39 @@ async def cb_end(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     await cb.answer("Ок", show_alert=False)
     await end_game(chat_id)
+
+
+# =========================
+# ВАЖНОЕ: приветствие в группе ТОЛЬКО 1 раз, когда добавили БОТА
+# =========================
+@dp.my_chat_member()
+async def on_my_chat_member(update: ChatMemberUpdated):
+    # Это событие приходит, когда статус БОТА меняется в чате
+    chat = update.chat
+
+    # только группы/супергруппы
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    old_status = update.old_chat_member.status
+    new_status = update.new_chat_member.status
+
+    # Бота добавили (из left/kicked -> member/administrator)
+    added = old_status in ("left", "kicked") and new_status in ("member", "administrator")
+    if not added:
+        return
+
+    # Не спамим: только 1 раз на чат
+    if was_group_welcome_sent(chat.id):
+        return
+
+    try:
+        await bot.send_message(chat.id, group_welcome_text(), parse_mode="Markdown")
+    except Exception:
+        # если нет прав писать — молча
+        return
+
+    mark_group_welcome_sent(chat.id)
 
 
 # =========================
