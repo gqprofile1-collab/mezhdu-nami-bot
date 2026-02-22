@@ -159,9 +159,14 @@ class GameState:
     total_votes: int = 0
 
     # таймеры/защита
-    extended_once: bool = False
+    extended_once: bool = False          # показали предложение продлить
+    extend_used: bool = False            # продление реально сделали (1 раз)
     awaiting_next: bool = False
     pause_gate: bool = False
+
+    # IDs сообщений (для удаления/контроля)
+    current_vote_msg_id: Optional[int] = None     # сообщение с кнопками игроков
+    extend_prompt_msg_id: Optional[int] = None    # служебное сообщение "продлим?"
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
     watchdog_task: Optional[asyncio.Task] = None
@@ -291,7 +296,7 @@ def get_host(gs: GameState) -> Optional[int]:
 
 
 # =========================
-# RESULT TEXT HELPERS (чтобы не падало)
+# RESULT TEXT HELPERS
 # =========================
 def reaction_for_result(items: List[Tuple[int, int]], total_votes: int) -> str:
     if total_votes <= 0 or not items:
@@ -462,8 +467,8 @@ def kb_paused():
 
 def kb_not_all_voted():
     b = InlineKeyboardBuilder()
-    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")
-    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")  # только ведущему
+    b.button(text=f"⏳ +{EXTEND_SECONDS} секунд", callback_data="extend")  # только ведущий (проверка в handler)
+    b.button(text="😈 Не ждём опоздавших", callback_data="force_result")   # только ведущий (проверка в handler)
     b.button(text="🛑 Завершить", callback_data="end")
     b.adjust(1, 1, 1)
     return b.as_markup()
@@ -521,7 +526,11 @@ async def start_round(chat_id: int):
 
     gs.awaiting_next = False
     gs.pause_gate = False
+
+    # сбрасываем продления/служебные сообщения на раунд
     gs.extended_once = False
+    gs.extend_used = False
+    gs.extend_prompt_msg_id = None
 
     gs.round += 1
     gs.votes_by_target.clear()
@@ -555,7 +564,9 @@ async def start_round(chat_id: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="MarkdownV2")
+    msg = await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="MarkdownV2")
+    gs.current_vote_msg_id = msg.message_id
+
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
@@ -571,27 +582,35 @@ async def round_timer(chat_id: int, seconds: int):
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
 
+    # ВАЖНО:
+    # - extended_once: мы уже ПРЕДЛОЖИЛИ продлить (показали служебное сообщение)
+    # - extend_used: ведущий уже НАЖАЛ продлить (1 раз)
     if not gs.extended_once and (not_all_voted or gs.total_votes == 0):
         gs.extended_once = True
         touch(gs)
 
+        # если служебное уже висит — не спамим
+        if gs.extend_prompt_msg_id:
+            return
+
         missing = len(gs.round_voters) - len(gs.voted_users)
         if gs.total_votes == 0:
-            msg = (
+            msg_text = (
                 "Время вышло ⏰\n"
                 "И… никто не проголосовал.\n\n"
                 f"Дадим ещё {EXTEND_SECONDS} секунд?\n"
-                "Или ведущий может не ждать 😈"
+                "Только ведущий может продлить 😏"
             )
         else:
-            msg = (
+            msg_text = (
                 "Время вышло ⏰\n"
                 f"Не все успели проголосовать: ещё {missing} чел.\n\n"
                 f"Продлим на {EXTEND_SECONDS} секунд?\n"
-                "Или ведущий может не ждать опоздавших 😈"
+                "Только ведущий может продлить 😏"
             )
 
-        await bot.send_message(chat_id, msg, reply_markup=kb_not_all_voted())
+        m = await bot.send_message(chat_id, msg_text, reply_markup=kb_not_all_voted())
+        gs.extend_prompt_msg_id = m.message_id
         return
 
     await show_round_result(chat_id)
@@ -607,6 +626,14 @@ async def show_round_result(chat_id: int):
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
+
+    # подчистим служебное "продлим?", если осталось
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
 
     if gs.total_votes == 0:
         text = (
@@ -668,6 +695,14 @@ async def end_game(chat_id: int, reason: str = ""):
     if gs.watchdog_task and not gs.watchdog_task.done():
         gs.watchdog_task.cancel()
 
+    # подчистим служебное "продлим?", если осталось
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
+
     text = final_top3_text(gs)
     if reason:
         text = reason + "\n\n" + text
@@ -705,18 +740,8 @@ async def cmd_help(message: Message):
     )
 
 
-# АВАРИЙНЫЙ СБРОС, если игра “якобы идёт”, но управлять нельзя
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
-    chat_id = message.chat.id
-    if chat_id not in GAMES:
-        await message.answer("Игры сейчас нет 😏")
-        return
-    await end_game(chat_id, reason="Ок. Сбросил игру 🧹\nМожно начинать заново: «Начать игру»")
-
-
-@dp.message(F.text.casefold() == "сброс")
-async def txt_reset(message: Message):
     chat_id = message.chat.id
     if chat_id not in GAMES:
         await message.answer("Игры сейчас нет 😏")
@@ -765,6 +790,13 @@ async def cb_cancel(cb: CallbackQuery):
             gs.round_timer_task.cancel()
         if gs.watchdog_task and not gs.watchdog_task.done():
             gs.watchdog_task.cancel()
+        if gs.extend_prompt_msg_id:
+            try:
+                await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+            except Exception:
+                pass
+            gs.extend_prompt_msg_id = None
+
     GAMES.pop(chat_id, None)
 
     await cb.answer("Ок")
@@ -901,7 +933,7 @@ async def cb_vote(cb: CallbackQuery):
 
 
 # =========================
-# FIX: extend НЕ УБИВАЕТ КНОПКИ
+# EXTEND: только ведущий, удаляем служебное сообщение, голосование остаётся на прошлом сообщении
 # =========================
 @dp.callback_query(F.data == "extend")
 async def cb_extend(cb: CallbackQuery):
@@ -915,24 +947,42 @@ async def cb_extend(cb: CallbackQuery):
         await cb.answer("Поздно. Уже считаю 😈", show_alert=False)
         return
 
+    host = get_host(gs)
+    if host is not None and cb.from_user.id != host:
+        await cb.answer("Продлить может только ведущий 😏", show_alert=True)
+        return
+
+    if gs.extend_used:
+        await cb.answer("Уже продлили 😏", show_alert=False)
+        # попробуем убрать служебку
+        try:
+            await cb.message.delete()
+        except Exception:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        gs.extend_prompt_msg_id = None
+        return
+
+    gs.extend_used = True
     touch(gs)
-    await cb.answer("Ок, +15 😏", show_alert=False)
+    await cb.answer(f"+{EXTEND_SECONDS} сек 😏", show_alert=False)
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
-    # ВАЖНО: при edit_text всегда передаём reply_markup, иначе кнопки исчезнут
+    # удаляем служебное сообщение "продлим?"
     try:
-        await cb.message.edit_text(
-            f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈",
-            reply_markup=kb_not_all_voted(),
-        )
+        await cb.message.delete()
     except Exception:
-        await cb.message.answer(
-            f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈",
-            reply_markup=kb_not_all_voted(),
-        )
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    gs.extend_prompt_msg_id = None
 
 
 @dp.callback_query(F.data == "force_result")
@@ -996,6 +1046,14 @@ async def cb_pause(cb: CallbackQuery):
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
+
+    # подчистим служебное "продлим?", если висит
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
 
     await cb.answer("Пауза", show_alert=False)
     try:
