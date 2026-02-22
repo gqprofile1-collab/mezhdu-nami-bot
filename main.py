@@ -44,6 +44,9 @@ MIN_PLAYERS = 2
 ROUND_VOTE_SECONDS = 15
 EXTEND_SECONDS = 15
 
+# Если ведущий после "Время вышло" ничего не нажал — чтобы не зависало.
+EXTEND_DECISION_TIMEOUT = 20  # сек
+
 LOBBY_CLOSE_SEC = 5 * 60
 SESSION_CLOSE_SEC = 10 * 60
 
@@ -192,12 +195,10 @@ class GameState:
     voted_users: Set[int] = field(default_factory=set)
     total_votes: int = 0
 
-    extended_prompted: bool = False
-    extend_used: bool = False
+    extended_prompted: bool = False     # мы уже показали экран "время вышло / продлить?"
+    extend_used: bool = False           # ведущий уже продлял (это "вторая попытка")
     extend_prompt_msg_id: Optional[int] = None
-
-    # ✅ 1 = первая попытка, 2 = продление (вторая попытка)
-    vote_phase: int = 1
+    extend_decision_task: Optional[asyncio.Task] = None  # авто-подведение итога если ведущий молчит
 
     awaiting_next: bool = False
     ended: bool = False
@@ -215,9 +216,6 @@ class GameState:
     # round identity
     round_msg_id: Optional[int] = None
     round_token: int = 0
-
-    # end confirm anti-stale
-    end_confirm_msg_ids: Set[int] = field(default_factory=set)
 
     current_question: str = ""
 
@@ -471,11 +469,10 @@ TIMEUP_MISSING = [
     "Жду <b>{missing}</b>.\nНо недолго 😈",
 ]
 
-# ✅ фраза “вторая попытка была, но…”
-SECOND_CHANCE_FAIL = [
-    "Даже после второй попытки… <b>кто-то не справился с такой простой задачей</b> 😏",
-    "Продлили. Подождали. И всё равно <b>кто-то</b> сдался 🤫",
-    "Вторая попытка была. Но у некоторых кнопки — это уже <b>высшая математика</b> 😈",
+SECOND_CHANCE_SNARK = [
+    "Даже после <b>второй попытки</b> проголосовать, <b>{missing}</b> не справились с такой простой задачей 😏",
+    "<b>{missing}</b> всё ещё без голоса. Руки заняты? Или совесть? 😈",
+    "Вторая попытка была. <b>{missing}</b> всё равно молчат. Официально: слабовато 😏",
 ]
 
 
@@ -853,20 +850,6 @@ async def stale_lobby(cb: CallbackQuery):
         pass
 
 
-async def stale_round_soft(cb: CallbackQuery):
-    # мягко: не удаляем сообщение с голосованием/итогами
-    await cb.answer("Это старые кнопки 😏", show_alert=True)
-
-
-async def stale_round(cb: CallbackQuery):
-    # жёстко: для prompt/confirm сообщений можно удалять
-    await cb.answer("Это старые кнопки 😏", show_alert=True)
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-
 # =========================
 # CLEANUP / WATCHDOG / REMINDER
 # =========================
@@ -878,14 +861,16 @@ async def cleanup_game(gs: GameState):
     if gs.watchdog_task and not gs.watchdog_task.done():
         gs.watchdog_task.cancel()
 
+    if gs.extend_decision_task and not gs.extend_decision_task.done():
+        gs.extend_decision_task.cancel()
+    gs.extend_decision_task = None
+
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(gs.chat_id, gs.extend_prompt_msg_id)
         except Exception:
             pass
         gs.extend_prompt_msg_id = None
-
-    gs.end_confirm_msg_ids.clear()
 
     await safe_clear_markup(gs.chat_id, gs.round_msg_id)
     await safe_clear_markup(gs.chat_id, gs.lobby_msg_id)
@@ -989,21 +974,17 @@ async def start_round(chat_id: int):
 
     touch(gs)
 
-    # ✅ Сначала новый токен — чтобы старые нажатия отрубались мгновенно
-    gs.round_token += 1
-    token = gs.round_token
-
-    # отмена старого таймера и снятие клавы
-    if gs.round_timer_task and not gs.round_timer_task.done():
-        gs.round_timer_task.cancel()
-
+    # чистим все старые штуки раунда
     await safe_clear_markup(chat_id, gs.round_msg_id)
     gs.round_msg_id = None
 
     gs.awaiting_next = False
     gs.extended_prompted = False
     gs.extend_used = False
-    gs.vote_phase = 1  # ✅ первая попытка
+
+    if gs.extend_decision_task and not gs.extend_decision_task.done():
+        gs.extend_decision_task.cancel()
+    gs.extend_decision_task = None
 
     if gs.extend_prompt_msg_id:
         try:
@@ -1056,13 +1037,36 @@ async def start_round(chat_id: int):
         f"<b>Голосуйте</b> 👇"
     )
 
+    gs.round_token += 1
+    token = gs.round_token
+
+    if gs.round_timer_task and not gs.round_timer_task.done():
+        gs.round_timer_task.cancel()
+
     m = await bot.send_message(chat_id, text, reply_markup=kb_vote(gs, token), parse_mode="HTML")
     gs.round_msg_id = m.message_id
 
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS, token))
 
 
-# ✅ FIX: вторая попытка всегда заканчивается итогом
+async def extend_decision_timeout(chat_id: int, token: int):
+    # если ведущий ничего не нажал на экране "продлить/не ждём" — не зависаем
+    try:
+        await asyncio.sleep(EXTEND_DECISION_TIMEOUT)
+    except asyncio.CancelledError:
+        return
+
+    gs = GAMES.get(chat_id)
+    if not gs or gs.ended or gs.state != State.RUNNING:
+        return
+    if token != gs.round_token or gs.awaiting_next:
+        return
+
+    # если экран продления до сих пор висит — подводим итог автоматически
+    if gs.extend_prompt_msg_id:
+        await show_round_result(chat_id, token)
+
+
 async def round_timer(chat_id: int, seconds: int, token: int):
     try:
         await asyncio.sleep(seconds)
@@ -1075,18 +1079,12 @@ async def round_timer(chat_id: int, seconds: int, token: int):
     if token != gs.round_token or gs.awaiting_next:
         return
 
-    touch(gs)
-
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
 
-    # ✅ Если уже фаза 2 — всегда итог, без промптов/повторов
-    if gs.vote_phase >= 2:
-        await show_round_result(chat_id, token)
-        return
-
-    # ✅ Первая попытка: если не все проголосовали (или 0 голосов) — показываем промпт
+    # Первый таймер: показываем экран решения ведущего (если есть смысл).
     if not gs.extended_prompted and (not_all_voted or gs.total_votes == 0):
         gs.extended_prompted = True
+        touch(gs)
 
         missing = len(gs.round_voters) - len(gs.voted_users)
         msg = random.choice(TIMEUP_NO_VOTES) if gs.total_votes == 0 else random.choice(TIMEUP_MISSING).format(missing=missing)
@@ -1098,9 +1096,15 @@ async def round_timer(chat_id: int, seconds: int, token: int):
             parse_mode="HTML",
         )
         gs.extend_prompt_msg_id = m.message_id
+
+        # ВАЖНО: чтобы не зависало, если ведущий молчит
+        if gs.extend_decision_task and not gs.extend_decision_task.done():
+            gs.extend_decision_task.cancel()
+        gs.extend_decision_task = asyncio.create_task(extend_decision_timeout(chat_id, token))
+
         return
 
-    # если промпт уже был — тоже считаем
+    # Второй таймер (или уже были подсказки) — итоги подводим ВСЕГДА.
     await show_round_result(chat_id, token)
 
 
@@ -1117,6 +1121,10 @@ async def show_round_result(chat_id: int, token: int):
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
+    if gs.extend_decision_task and not gs.extend_decision_task.done():
+        gs.extend_decision_task.cancel()
+    gs.extend_decision_task = None
+
     if gs.extend_prompt_msg_id:
         try:
             await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
@@ -1124,24 +1132,27 @@ async def show_round_result(chat_id: int, token: int):
             pass
         gs.extend_prompt_msg_id = None
 
-    # ✅ пометка “вторая попытка была, но…”
-    missing = len(gs.round_voters) - len(gs.voted_users)
-    second_chance_line = ""
-    if gs.vote_phase >= 2 and missing > 0:
-        second_chance_line = "\n" + random.choice(SECOND_CHANCE_FAIL) + "\n"
-
     await safe_clear_markup(chat_id, gs.round_msg_id)
     gs.round_msg_id = None
 
+    missing = len(gs.round_voters) - len(gs.voted_users)
+
+    # Если это была "вторая попытка" (extend_used=True) и всё равно не все проголосовали — добавим токс-строку.
+    snark_line = ""
+    if gs.extend_used and missing > 0:
+        snark_line = random.choice(SECOND_CHANCE_SNARK).format(missing=missing)
+
     if gs.total_votes == 0:
-        await bot.send_message(
-            chat_id,
-            f"<b>ИТОГ РАУНДА {gs.round}:</b>\n"
-            f"{second_chance_line}"
-            "Никого не выбрали.\nСлишком мирно… подозрительно 🤨",
-            reply_markup=kb_result(token),
-            parse_mode="HTML",
-        )
+        lines = [
+            f"<b>ИТОГ РАУНДА {gs.round}:</b>",
+            "Никого не выбрали.",
+            "Слишком мирно… подозрительно 🤨",
+        ]
+        if snark_line:
+            lines.append("")
+            lines.append(snark_line)
+
+        await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(token), parse_mode="HTML")
         return
 
     items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
@@ -1149,9 +1160,6 @@ async def show_round_result(chat_id: int, token: int):
     top_all = [uid for uid, c in items if c == top_count]
 
     lines = [f"<b>ИТОГ РАУНДА {gs.round}:</b>"]
-    if second_chance_line:
-        lines.append(second_chance_line.strip())
-
     for uid, c in items:
         if c <= 0:
             continue
@@ -1172,6 +1180,10 @@ async def show_round_result(chat_id: int, token: int):
         names = ", ".join([gs.players[uid].label for uid in top_all if uid in gs.players])
         lines.append(f"<b>Ничья:</b> {h(names)}")
         lines.append("Красиво разошлись. Но я всё равно <b>запомнил</b> 😏")
+
+    if snark_line:
+        lines.append("")
+        lines.append(snark_line)
 
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result(token), parse_mode="HTML")
 
@@ -1341,9 +1353,8 @@ async def cb_mode_boys(cb: CallbackQuery):
 async def cb_cancel(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-
-    if not gs or gs.ended:
-        await stale_lobby(cb)
+    if not gs:
+        await cb.answer("Ок 😏")
         return
 
     if gs.state == State.LOBBY:
@@ -1366,7 +1377,7 @@ async def cb_join(cb: CallbackQuery):
     gs = GAMES.get(chat_id)
 
     if not gs or gs.ended or gs.state not in (State.LOBBY, State.RUNNING):
-        await stale_lobby(cb)
+        await cb.answer("Сессии нет 😏 Напиши «Начать игру».", show_alert=True)
         return
 
     if gs.state == State.LOBBY:
@@ -1405,12 +1416,7 @@ async def cb_join(cb: CallbackQuery):
 async def cb_start(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
-
-    if not gs or gs.ended:
-        await stale_lobby(cb)
-        return
-
-    if gs.state != State.LOBBY:
+    if not gs or gs.state != State.LOBBY or gs.ended:
         await cb.answer("Это уже не лобби 😏", show_alert=False)
         return
 
@@ -1457,10 +1463,11 @@ async def cb_vote(cb: CallbackQuery):
         return
 
     if token != gs.round_token or cb.message.message_id != gs.round_msg_id:
-        await stale_round_soft(cb)
+        await cb.answer("Поздно 😏 Это был прошлый раунд.", show_alert=False)
         return
 
     touch(gs)
+    ensure_watchdog(gs)
 
     voter_id = cb.from_user.id
     if voter_id not in gs.round_voters:
@@ -1486,9 +1493,13 @@ async def cb_vote(cb: CallbackQuery):
 
     await cb.answer("Засчитано ✅")
 
+    # если все проголосовали — сразу итог
     if len(gs.voted_users) >= len(gs.round_voters):
         if gs.round_timer_task and not gs.round_timer_task.done():
             gs.round_timer_task.cancel()
+        if gs.extend_decision_task and not gs.extend_decision_task.done():
+            gs.extend_decision_task.cancel()
+        gs.extend_decision_task = None
         await show_round_result(chat_id, gs.round_token)
 
 
@@ -1497,7 +1508,7 @@ async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING or gs.ended:
-        await stale_round(cb)
+        await cb.answer("Уже поздно 😏")
         return
 
     token = parse_tail_int(cb.data or "")
@@ -1505,8 +1516,9 @@ async def cb_extend(cb: CallbackQuery):
         await cb.answer("Криво нажалось 🤨")
         return
 
+    # продление относится только к текущему раунду и к сообщению-приглашению
     if token != gs.round_token or cb.message.message_id != gs.extend_prompt_msg_id:
-        await stale_round(cb)
+        await cb.answer("Поздно 😏 Уже другой движ.", show_alert=False)
         return
 
     host = get_host(gs)
@@ -1523,9 +1535,14 @@ async def cb_extend(cb: CallbackQuery):
         return
 
     gs.extend_used = True
-    gs.vote_phase = 2  # ✅ вторая попытка
     touch(gs)
+    ensure_watchdog(gs)
     await cb.answer(f"+{EXTEND_SECONDS} сек 😏")
+
+    # отменяем авто-таймаут решения ведущего
+    if gs.extend_decision_task and not gs.extend_decision_task.done():
+        gs.extend_decision_task.cancel()
+    gs.extend_decision_task = None
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
@@ -1543,7 +1560,7 @@ async def cb_force_result(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING or gs.ended:
-        await stale_round(cb)
+        await cb.answer("Уже поздно 😏")
         return
 
     token = parse_tail_int(cb.data or "")
@@ -1552,7 +1569,7 @@ async def cb_force_result(cb: CallbackQuery):
         return
 
     if token != gs.round_token or cb.message.message_id != gs.extend_prompt_msg_id:
-        await stale_round(cb)
+        await cb.answer("Поздно 😏 Это было про прошлый раунд.", show_alert=False)
         return
 
     host = get_host(gs)
@@ -1561,7 +1578,12 @@ async def cb_force_result(cb: CallbackQuery):
         return
 
     touch(gs)
+    ensure_watchdog(gs)
     await cb.answer("Ок. Не ждём 😈")
+
+    if gs.extend_decision_task and not gs.extend_decision_task.done():
+        gs.extend_decision_task.cancel()
+    gs.extend_decision_task = None
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
@@ -1589,7 +1611,7 @@ async def cb_next(cb: CallbackQuery):
         return
 
     if token != gs.round_token:
-        await stale_round_soft(cb)
+        await cb.answer("Поздно 😏 Это был прошлый раунд.", show_alert=False)
         return
 
     if not anti_spam_next_ok(gs, cb.from_user.id):
@@ -1599,6 +1621,9 @@ async def cb_next(cb: CallbackQuery):
     if not gs.awaiting_next:
         await cb.answer("Сначала итог 😈")
         return
+
+    touch(gs)
+    ensure_watchdog(gs)
 
     await cb.answer(pick(NEXT_TOASTS))
     await start_round(chat_id)
@@ -1614,23 +1639,16 @@ async def cb_end_req(cb: CallbackQuery):
         await cb.answer("Ок 😏")
         return
     await cb.answer("Точно? 😏")
-    m = await bot.send_message(
+    await bot.send_message(
         cb.message.chat.id,
         "Точно <b>завершить игру</b>?",
         reply_markup=kb_end_confirm(),
         parse_mode="HTML",
     )
-    gs.end_confirm_msg_ids.add(m.message_id)
 
 
 @dp.callback_query(F.data == "end_no")
 async def cb_end_no(cb: CallbackQuery):
-    gs = GAMES.get(cb.message.chat.id)
-    if not gs or gs.ended or cb.message.message_id not in gs.end_confirm_msg_ids:
-        await stale_round(cb)
-        return
-    gs.end_confirm_msg_ids.discard(cb.message.message_id)
-
     await cb.answer("Ок 😏")
     try:
         await cb.message.delete()
@@ -1640,12 +1658,6 @@ async def cb_end_no(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "end_yes")
 async def cb_end_yes(cb: CallbackQuery):
-    gs = GAMES.get(cb.message.chat.id)
-    if not gs or gs.ended or cb.message.message_id not in gs.end_confirm_msg_ids:
-        await stale_round(cb)
-        return
-    gs.end_confirm_msg_ids.discard(cb.message.message_id)
-
     await cb.answer("Ладно.")
     try:
         await cb.message.delete()
