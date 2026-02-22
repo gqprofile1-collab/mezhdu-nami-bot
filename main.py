@@ -1,17 +1,23 @@
 import asyncio
+import json
 import os
 import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Set, Optional, List, Tuple
-import json
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    Message,
+    PreCheckoutQuery,
+    LabeledPrice,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -22,8 +28,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения (Railway Variables).")
 
-# username подтянем автоматически при старте
-BOT_USERNAME: str = ""
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS: Set[int] = set()
+if ADMIN_IDS_RAW:
+    for x in ADMIN_IDS_RAW.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
 
 MAX_PLAYERS = 10
 MIN_PLAYERS = 2
@@ -36,12 +47,15 @@ SESSION_CLOSE_SEC = 10 * 60
 
 NEXT_COOLDOWN_SEC = 1.0
 
-# =========================
-# REMINDERS + META STORE
-# =========================
-CHATS_STORE_PATH = "chats.json"
+DATA_DIR = Path(".")
+CHATS_STORE_PATH = DATA_DIR / "chats.json"
+STATS_PATH = DATA_DIR / "stats.json"
+SUGGESTIONS_PATH = DATA_DIR / "suggestions.json"
+
 REMIND_EVERY_SEC = 3 * 24 * 60 * 60
 REMIND_CHECK_SEC = 60 * 60
+
+BOT_USERNAME: str = ""
 
 
 # =========================
@@ -115,13 +129,11 @@ class State(str, Enum):
     IDLE = "IDLE"
     LOBBY = "LOBBY"
     RUNNING = "RUNNING"
-    PAUSED = "PAUSED"
 
 
 @dataclass
 class Player:
     user_id: int
-    name: str
     label: str
     score: int = 0
 
@@ -129,7 +141,6 @@ class Player:
 @dataclass
 class GameState:
     chat_id: int
-
     state: State = State.IDLE
     host_user_id: Optional[int] = None
 
@@ -137,7 +148,6 @@ class GameState:
     join_order: List[int] = field(default_factory=list)
 
     round: int = 0
-
     used_normal: Set[int] = field(default_factory=set)
     used_spicy: Set[int] = field(default_factory=set)
 
@@ -147,10 +157,6 @@ class GameState:
     since_last_secret: int = 0
     next_secret_at: int = field(default_factory=lambda: random.randint(4, 5))
 
-    current_question: Optional[str] = None
-    current_is_spicy: bool = False
-    current_has_secret: bool = False
-
     round_targets: List[int] = field(default_factory=list)
     round_voters: Set[int] = field(default_factory=set)
 
@@ -158,12 +164,11 @@ class GameState:
     voted_users: Set[int] = field(default_factory=set)
     total_votes: int = 0
 
-    extended_once: bool = False
+    extended_prompted: bool = False
     extend_used: bool = False
-    awaiting_next: bool = False
-    pause_gate: bool = False
-
     extend_prompt_msg_id: Optional[int] = None
+
+    awaiting_next: bool = False
 
     last_activity: datetime = field(default_factory=datetime.utcnow)
     watchdog_task: Optional[asyncio.Task] = None
@@ -176,138 +181,194 @@ GAMES: Dict[int, GameState] = {}
 
 
 # =========================
-# STORE helpers (chats.json)
+# JSON helpers
 # =========================
-def _load_chats_store() -> Dict[str, Dict]:
-    p = Path(CHATS_STORE_PATH)
-    if not p.exists():
-        return {}
+def _read_json(path: Path, default):
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return default
 
 
-def _save_chats_store(data: Dict[str, Dict]) -> None:
-    p = Path(CHATS_STORE_PATH)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _write_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def mark_chat_started(chat_id: int) -> None:
-    data = _load_chats_store()
+# =========================
+# STATS
+# =========================
+def stats_init():
+    if STATS_PATH.exists():
+        return
+    _write_json(STATS_PATH, {
+        "users_unique": 0,
+        "users_seen": [],
+        "chats_unique": 0,
+        "chats_seen": [],
+        "games_started": 0,
+        "rounds_played": 0,
+        "votes_cast": 0,
+        "donations_stars_total": 0,
+        "donations_count": 0,
+        "suggestions_count": 0,
+        "updated_ts": int(time.time()),
+    })
+
+
+def stats_touch_user(user_id: int):
+    s = _read_json(STATS_PATH, {})
+    seen = set(s.get("users_seen", []))
+    if user_id not in seen:
+        seen.add(user_id)
+        s["users_seen"] = sorted(list(seen))
+        s["users_unique"] = len(seen)
+    s["updated_ts"] = int(time.time())
+    _write_json(STATS_PATH, s)
+
+
+def stats_touch_chat(chat_id: int):
+    s = _read_json(STATS_PATH, {})
+    seen = set(s.get("chats_seen", []))
+    if chat_id not in seen:
+        seen.add(chat_id)
+        s["chats_seen"] = sorted(list(seen))
+        s["chats_unique"] = len(seen)
+    s["updated_ts"] = int(time.time())
+    _write_json(STATS_PATH, s)
+
+
+def stats_inc(key: str, n: int = 1):
+    s = _read_json(STATS_PATH, {})
+    s[key] = int(s.get(key, 0)) + n
+    s["updated_ts"] = int(time.time())
+    _write_json(STATS_PATH, s)
+
+
+# =========================
+# CHATS STORE (reminders + group welcome once)
+# =========================
+def chats_store_mark_game_started(chat_id: int) -> None:
+    data = _read_json(CHATS_STORE_PATH, {})
     key = str(chat_id)
     now = int(time.time())
     meta = data.get(key, {})
     meta["last_started_ts"] = now
     meta.setdefault("last_reminded_ts", 0)
     data[key] = meta
-    _save_chats_store(data)
+    _write_json(CHATS_STORE_PATH, data)
 
 
-def mark_group_welcome_sent(chat_id: int) -> None:
-    data = _load_chats_store()
-    key = str(chat_id)
-    now = int(time.time())
-    meta = data.get(key, {})
-    meta["welcome_sent_ts"] = now
-    data[key] = meta
-    _save_chats_store(data)
-
-
-def was_group_welcome_sent(chat_id: int) -> bool:
-    data = _load_chats_store()
+def chats_store_welcome_sent(chat_id: int) -> bool:
+    data = _read_json(CHATS_STORE_PATH, {})
     meta = data.get(str(chat_id), {})
     return int(meta.get("welcome_sent_ts", 0)) > 0
 
 
-# =========================
-# TEXTS
-# =========================
-def dm_welcome_text() -> str:
-    return (
-        "Привет 😏\n\n"
-        "Я — *«Между нами 🤫»*.\n"
-        "Игра для компаний: вопрос → голосование → итог → следующий.\n\n"
-        "Как запустить:\n"
-        "1) Добавь меня в группу\n"
-        "2) В группе напиши: *Начать игру* 😈\n\n"
-        "/help — правила\n"
-        "Я не осуждаю.\n"
-        "Я запоминаю 😈"
-    )
-
-
-def group_welcome_text() -> str:
-    return (
-        "Я тут 😏\n"
-        "Это *«Между нами 🤫»*.\n\n"
-        "Чтобы начать — напишите:\n"
-        "*Начать игру* 😈\n\n"
-        "/help — правила"
-    )
-
-
-def already_voted_phrase() -> str:
-    return random.choice([
-        "Ты уже сделал выбор 😏",
-        "Один раз и всё 🤫",
-        "Поздно менять сторону 😈",
-        "Решил — живи с этим.",
-        "Без переигровок 😏",
-    ])
-
-
-def time_up_phrase(missing: int, no_votes: bool) -> str:
-    if no_votes:
-        return random.choice([
-            "Время вышло ⏰\nИ… никто не рискнул 😏",
-            "Ноль голосов.\nБоимся? 😈",
-            "Тишина.\nПодозрительно 🤫",
-        ])
-    return random.choice([
-        f"Время вышло ⏰\nЕщё {missing} человек молчат…",
-        f"{missing} всё ещё думают 😏",
-        f"Ещё {missing} и можно делать выводы 😈",
-    ])
-
-
-def next_ack_phrase() -> str:
-    return random.choice([
-        "Продолжаем 😈",
-        "Поехали дальше 😏",
-        "Ещё раунд? Люблю это 😈",
-    ])
-
-
-def end_phrase_inactive() -> str:
-    return random.choice([
-        "10 минут тишины… я понял 🫠\nЗакрываю игру.\nВернётесь — продолжим 😈",
-        "Чат ушёл в спячку 😴\nЗакрываю игру. Но я рядом 😏",
-    ])
-
-
-def cancel_phrase() -> str:
-    return random.choice([
-        "Ок. Отменяем 😏\nИнтрига остаётся.",
-        "Передумали? Интересно 🤫",
-        "Ладно.\nВ этот раз без разоблачений 😈",
-    ])
+def chats_store_mark_welcome(chat_id: int) -> None:
+    data = _read_json(CHATS_STORE_PATH, {})
+    key = str(chat_id)
+    meta = data.get(key, {})
+    meta["welcome_sent_ts"] = int(time.time())
+    data[key] = meta
+    _write_json(CHATS_STORE_PATH, data)
 
 
 # =========================
-# KEYBOARDS
+# STYLE
 # =========================
-def kb_add_to_group():
+def pick(arr: List[str]) -> str:
+    return random.choice(arr)
+
+
+DM_WELCOME_VARIANTS = [
+    "Этот бот поможет вам не заскучать, задавая колкие вопросы.\nНадеюсь, вы не поругаетесь во время игры 😈",
+    "Я тут, чтобы компания не тухла.\nВопросы — острые. Итоги — неловкие.\nНе подеритесь там 😏",
+    "Если в чате стало слишком тихо — я сейчас это исправлю.\nГлавное: не обижайтесь. Почти 🤫",
+    "Я добавляю жару в любой чат.\nКолкие вопросы, быстрые голосования.\nНадеюсь, вы выживете 😈",
+    "Устроим мини-реалити в вашем чате.\nВопрос → голосование → итог.\nДа, будет неловко 😏",
+]
+
+ALREADY_VOTED_VARIANTS = [
+    "Всё, выбор сделан 😏",
+    "Один голос — и живи с этим 🤫",
+    "Поздно переобуваться 😈",
+    "Голос уже улетел. Не догоняй.",
+    "Второй попытки не будет 😏",
+    "Без переигровок. Я строгий.",
+    "Ты уже отметился 😈",
+    "Назад дороги нет 🤫",
+    "Переобувка запрещена 😏",
+    "Голос засчитан. Терпи 😈",
+]
+
+NEXT_VARIANTS = [
+    "Дальше 😈",
+    "Ещё один раунд? С удовольствием 😏",
+    "Поехали. Сейчас будет лучше.",
+    "Не тормозим 🤫",
+    "Продолжаем — и не краснеем 😈",
+    "Следующий. Держитесь.",
+    "Ок, жмём газ 😏",
+    "Вперёд. Я только разогрелся 😈",
+    "Ещё вопросик — и кто-то вскроется 🤫",
+    "Погнали. Без лишних слов 😏",
+]
+
+END_VARIANTS = [
+    "Было опасно приятно 😈 Возвращайтесь.",
+    "Ну всё, красавчики. Захотите ещё — зовите 😏",
+    "Игра окончена. Обиды не хранить. Почти 🤫",
+    "Разошлись красиво. Но я всё запомнил 😈",
+    "Спасибо за игру. В следующий раз будет ещё больнее 😏",
+    "Конец. И да — это между нами 🤫",
+    "Пауза на жизнь. Потом продолжим 😈",
+    "Вы держались достойно. Почти 😏",
+    "Игра закрыта. Кто обиделся — тот проиграл 🤫",
+    "До встречи. Я рядом, когда станет скучно 😈",
+]
+
+INACTIVE_END_VARIANTS = [
+    "10 минут тишины… я понял 🫠 Закрываю игру. Вернётесь — продолжим 😈",
+    "Чат ушёл в спячку 😴 Я закрываю сессию. Но я рядом 😏",
+    "Тишина слишком громкая 🤫 Закрываю игру.",
+    "Всё, пауза затянулась. Закрываю 😈",
+    "Я подождал. Хватит 🤫 Закрываю.",
+]
+
+TIMEUP_NO_VOTES = [
+    "Время вышло ⏰ И… никто не рискнул 😏",
+    "Ноль голосов. Слишком мило. Подозрительно 🤨",
+    "Тишина. Боитесь последствий? 😈",
+    "Никто не нажал. Ну вы и осторожные 🤫",
+    "Ноль. Я даже разочарован 😏",
+]
+
+TIMEUP_MISSING = [
+    "Время вышло ⏰ Ещё {missing} молчат…",
+    "{missing} всё ещё “думают” 😏",
+    "Ещё {missing} без голоса. Тянете драму 🤫",
+    "Жду {missing}. Но недолго 😈",
+    "Ещё {missing} — и считаем как есть 😏",
+]
+
+
+# =========================
+# UI
+# =========================
+def kb_dm_home():
     b = InlineKeyboardBuilder()
-    # кнопка появится, как только мы узнаем BOT_USERNAME (через get_me)
     if BOT_USERNAME:
         b.button(text="➕ Добавить в группу", url=f"https://t.me/{BOT_USERNAME}?startgroup=1")
-    b.button(text="📌 Как играть", callback_data="howto_dm")
-    b.adjust(1)
+    b.button(text="💡 Предложить вопрос", callback_data="dm_suggest_hint")
+    b.button(text="⭐ Поддержать Stars", callback_data="dm_donate_menu")
+    b.button(text="📌 Как играть", callback_data="dm_howto")
+    b.adjust(1, 1, 1, 1)
     return b.as_markup()
 
 
-def kb_lobby(gs: GameState):
+def kb_group_lobby():
     b = InlineKeyboardBuilder()
     b.button(text="✅ Присоединиться", callback_data="join")
     b.button(text="🔥 Ну что? Погнали?", callback_data="start")
@@ -322,11 +383,9 @@ def kb_vote(gs: GameState):
     targets.sort(key=lambda x: x[1].label.lower())
     for uid, p in targets:
         b.button(text=p.label, callback_data=f"vote:{uid}")
-
     cols = 2 if len(targets) <= 6 else 3
     if targets:
         b.adjust(*([cols] * ((len(targets) + cols - 1) // cols)))
-
     b.row()
     b.button(text="🛑 Завершить", callback_data="end")
     b.adjust(1)
@@ -350,12 +409,19 @@ def kb_not_all_voted():
     return b.as_markup()
 
 
+def kb_donate_amounts():
+    b = InlineKeyboardBuilder()
+    for amt in [10, 25, 50, 100, 250]:
+        b.button(text=f"⭐ {amt}", callback_data=f"donate:{amt}")
+    b.adjust(3, 2)
+    return b.as_markup()
+
+
 # =========================
-# HELPERS
+# Game helpers
 # =========================
 def touch(gs: GameState):
     gs.last_activity = datetime.utcnow()
-    mark_chat_started(gs.chat_id)
 
 
 def anti_spam_next_ok(gs: GameState, user_id: int) -> bool:
@@ -367,19 +433,8 @@ def anti_spam_next_ok(gs: GameState, user_id: int) -> bool:
     return True
 
 
-def base_name_from_user(u) -> str:
-    base = (u.full_name or "").strip()
-    if base:
-        return base
-    if u.username:
-        return f"@{u.username}"
-    return str(u.id)
-
-
-def make_unique_label(gs: GameState, u) -> str:
-    base = (u.full_name or "").strip()
-    if not base:
-        base = f"@{u.username}" if u.username else str(u.id)
+def make_label(gs: GameState, u) -> str:
+    base = (u.full_name or "").strip() or (f"@{u.username}" if u.username else str(u.id))
     if base.startswith("@"):
         return base
     existing = {p.label for p in gs.players.values()}
@@ -387,9 +442,9 @@ def make_unique_label(gs: GameState, u) -> str:
         return base
     i = 2
     while True:
-        label = f"{base}#{i}"
-        if label not in existing:
-            return label
+        candidate = f"{base}#{i}"
+        if candidate not in existing:
+            return candidate
         i += 1
 
 
@@ -424,28 +479,36 @@ def choose_question(gs: GameState) -> Tuple[str, bool, bool]:
     return q, is_spicy, has_secret
 
 
-def format_players(gs: GameState) -> str:
-    if not gs.players:
-        return "Пока никого."
-    return "• " + "\n• ".join([gs.players[uid].label for uid in gs.join_order if uid in gs.players])
-
-
 def get_host(gs: GameState) -> Optional[int]:
-    host = gs.host_user_id
-    if host is not None and host not in gs.players and gs.join_order:
-        host = gs.join_order[0]
-        gs.host_user_id = host
-    return host
+    if gs.host_user_id is not None:
+        return gs.host_user_id
+    if gs.join_order:
+        gs.host_user_id = gs.join_order[0]
+        return gs.host_user_id
+    return None
+
+
+async def cleanup_game(gs: GameState):
+    if gs.round_timer_task and not gs.round_timer_task.done():
+        gs.round_timer_task.cancel()
+    if gs.watchdog_task and not gs.watchdog_task.done():
+        gs.watchdog_task.cancel()
+    if gs.extend_prompt_msg_id:
+        try:
+            await bot.delete_message(gs.chat_id, gs.extend_prompt_msg_id)
+        except Exception:
+            pass
+        gs.extend_prompt_msg_id = None
 
 
 # =========================
-# REMINDERS loop
+# Reminder loop
 # =========================
 async def reminder_loop():
     while True:
         try:
             await asyncio.sleep(REMIND_CHECK_SEC)
-            data = _load_chats_store()
+            data = _read_json(CHATS_STORE_PATH, {})
             now = int(time.time())
 
             for key, meta in list(data.items()):
@@ -467,14 +530,17 @@ async def reminder_loop():
                 try:
                     await bot.send_message(
                         chat_id,
-                        "Эй 😏\nТри дня тишины…\nМожет, сыграем снова в «Между нами 🤫»?\n\nНапишите: «Начать игру» 👇",
+                        "Эй 😏\n"
+                        "Три дня тишины…\n"
+                        "Может, снова сыграем в «Между нами 🤫»?\n\n"
+                        "Напишите: «Начать игру» 👇",
                     )
                     meta["last_reminded_ts"] = now
                     data[key] = meta
                 except Exception:
                     continue
 
-            _save_chats_store(data)
+            _write_json(CHATS_STORE_PATH, data)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -482,7 +548,7 @@ async def reminder_loop():
 
 
 # =========================
-# WATCHDOG
+# Watchdog
 # =========================
 async def watchdog(chat_id: int):
     while True:
@@ -493,8 +559,22 @@ async def watchdog(chat_id: int):
 
         idle_sec = (datetime.utcnow() - gs.last_activity).total_seconds()
 
+        if gs.state == State.LOBBY and idle_sec >= LOBBY_CLOSE_SEC:
+            await cleanup_game(gs)
+            GAMES.pop(chat_id, None)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "Лобби протухло 🫠\n"
+                    "5 минут тишины — закрываю сбор.\n\n"
+                    "Если хотите снова — напишите «Начать игру».",
+                )
+            except Exception:
+                pass
+            return
+
         if gs.state != State.IDLE and idle_sec >= SESSION_CLOSE_SEC:
-            await end_game(chat_id, reason=end_phrase_inactive())
+            await end_game(chat_id, reason=pick(INACTIVE_END_VARIANTS))
             return
 
 
@@ -505,7 +585,7 @@ def ensure_watchdog(gs: GameState):
 
 
 # =========================
-# ROUND FLOW (упрощённо, как у тебя было)
+# Round flow
 # =========================
 async def start_round(chat_id: int):
     gs = GAMES.get(chat_id)
@@ -513,18 +593,20 @@ async def start_round(chat_id: int):
         return
 
     if len(gs.players) < MIN_PLAYERS:
-        await bot.send_message(chat_id, "Для игры нужно минимум двое.\nВсе разошлись? Я тоже пойду 😏")
+        await bot.send_message(chat_id, "Для игры нужно минимум двое.\nВсе разошлись? Я тоже 😏")
         await end_game(chat_id)
         return
 
     touch(gs)
 
     gs.awaiting_next = False
-    gs.extended_once = False
+    gs.extended_prompted = False
     gs.extend_used = False
     gs.extend_prompt_msg_id = None
 
     gs.round += 1
+    stats_inc("rounds_played", 1)
+
     gs.votes_by_target.clear()
     gs.voted_users.clear()
     gs.total_votes = 0
@@ -535,21 +617,25 @@ async def start_round(chat_id: int):
 
     q, is_spicy, has_secret = choose_question(gs)
 
-    q_line = md_bold_caps(q)
-    secret_line = "\n\n" + md_italic("Только честно. Это между нами 🤫") if has_secret else ""
-    spicy_line = "\n\n" + md_italic("Отвечайте честно. Это между нами 🤫") if is_spicy else ""
-    timer_line = "\n\n" + md_italic(f"({ROUND_VOTE_SECONDS} секунд на голосование)")
+    # лёгкий текст без markdownv2 адского (но можно расширить)
+    extra = []
+    if has_secret:
+        extra.append("Только честно. Это между нами 🤫")
+    if is_spicy:
+        extra.append("Отвечайте честно. Это между нами 🤫")
+    extra.append(f"{ROUND_VOTE_SECONDS} сек на голосование")
 
     text = (
         f"Раунд {gs.round} 😈\n\n"
-        f"{q_line}{secret_line}{spicy_line}{timer_line}\n\n"
+        f"{q}\n\n"
+        f"({', '.join(extra)})\n\n"
         f"Голосуйте 👇"
     )
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
 
-    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs), parse_mode="MarkdownV2")
+    await bot.send_message(chat_id, text, reply_markup=kb_vote(gs))
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, ROUND_VOTE_SECONDS))
 
 
@@ -564,16 +650,17 @@ async def round_timer(chat_id: int, seconds: int):
         return
 
     not_all_voted = len(gs.voted_users) < len(gs.round_voters)
-    if not gs.extended_once and (not_all_voted or gs.total_votes == 0):
-        gs.extended_once = True
+
+    if not gs.extended_prompted and (not_all_voted or gs.total_votes == 0):
+        gs.extended_prompted = True
         touch(gs)
 
         missing = len(gs.round_voters) - len(gs.voted_users)
-        no_votes = (gs.total_votes == 0)
+        msg = pick(TIMEUP_NO_VOTES) if gs.total_votes == 0 else pick(TIMEUP_MISSING).format(missing=missing)
 
         m = await bot.send_message(
             chat_id,
-            time_up_phrase(missing, no_votes) + f"\n\nДадим ещё {EXTEND_SECONDS} секунд?\nТолько ведущий может продлить 😏",
+            msg + f"\n\nДадим ещё {EXTEND_SECONDS} секунд?\nТолько ведущий может продлить 😏",
             reply_markup=kb_not_all_voted(),
         )
         gs.extend_prompt_msg_id = m.message_id
@@ -601,15 +688,22 @@ async def show_round_result(chat_id: int):
         gs.extend_prompt_msg_id = None
 
     if gs.total_votes == 0:
-        await bot.send_message(chat_id, f"Итог раунда {gs.round}:\nНикого не выбрали 😏", reply_markup=kb_result())
+        await bot.send_message(
+            chat_id,
+            f"Итог раунда {gs.round}:\nНикого не выбрали.\nСлишком мирно… подозрительно 🤨",
+            reply_markup=kb_result(),
+        )
         return
 
     items = sorted(gs.votes_by_target.items(), key=lambda x: x[1], reverse=True)
     lines = [f"Итог раунда {gs.round}:"]
     for uid, c in items:
+        if c <= 0:
+            continue
         p = gs.players.get(uid)
-        if p and c > 0:
-            lines.append(f"{p.label} — {c}")
+        if p:
+            lines.append(f"— {p.label}: {c}")
+
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_result())
 
 
@@ -617,88 +711,142 @@ async def end_game(chat_id: int, reason: str = ""):
     gs = GAMES.get(chat_id)
     if not gs:
         return
-
-    if gs.round_timer_task and not gs.round_timer_task.done():
-        gs.round_timer_task.cancel()
-    if gs.watchdog_task and not gs.watchdog_task.done():
-        gs.watchdog_task.cancel()
-
-    if gs.extend_prompt_msg_id:
-        try:
-            await bot.delete_message(chat_id, gs.extend_prompt_msg_id)
-        except Exception:
-            pass
-
+    await cleanup_game(gs)
     GAMES.pop(chat_id, None)
-    await bot.send_message(chat_id, reason or "Ок. Игра завершена 😏")
+
+    tail = pick(END_VARIANTS)
+    text = f"{reason}\n\n{tail}" if reason else tail
+    await bot.send_message(chat_id, text)
 
 
 # =========================
-# DM /start (главное)
+# PRIVATE /start
 # =========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    stats_touch_user(message.from_user.id)
+
     if message.chat.type == "private":
-        await message.answer(dm_welcome_text(), reply_markup=kb_add_to_group(), parse_mode="Markdown")
+        text = (
+            "Привет 😏\n\n"
+            f"{pick(DM_WELCOME_VARIANTS)}\n\n"
+            "Как запустить:\n"
+            "1) Добавь меня в группу\n"
+            "2) В группе напиши: *Начать игру*\n\n"
+            "/help — правила\n"
+            "/suggest <вопрос> — предложить свой\n"
+            "/donate — поддержать Stars ⭐"
+        )
+        await message.answer(text, reply_markup=kb_dm_home(), parse_mode="Markdown")
         return
-    await message.answer("Я тут 😏\nНапишите: «Начать игру»\n\n/help — правила")
+
+    await message.answer("Я тут 😏\nЧтобы начать — напишите: «Начать игру»\n/help — правила")
 
 
-@dp.callback_query(F.data == "howto_dm")
-async def cb_howto_dm(cb: CallbackQuery):
+# =========================
+# DM callbacks
+# =========================
+@dp.callback_query(F.data == "dm_howto")
+async def cb_dm_howto(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer(
         "Коротко:\n"
         "1) Добавь меня в группу\n"
-        "2) В группе напиши: *Начать игру*\n"
-        "3) Жмите «Присоединиться» и погнали 😈",
+        "2) В группе: *Начать игру*\n"
+        "3) Все жмут «Присоединиться»\n"
+        "4) Ведущий жмёт «Погнали»\n\n"
+        "Дальше: вопрос → голосование → итог.\n"
+        "За себя — нельзя 😈",
         parse_mode="Markdown",
     )
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "Как играем:\n"
-        "1) Напишите: Начать игру\n"
-        "2) Все жмут: Присоединиться\n"
-        "3) Создатель жмёт: Ну что? Погнали?\n"
-        "4) Вопрос → голосование → итог → следующий\n\n"
-        "Это между нами 🤫"
+@dp.callback_query(F.data == "dm_suggest_hint")
+async def cb_dm_suggest_hint(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "Ок 😏\nНапиши так:\n"
+        "* /suggest Кто из вас…? *\n\n"
+        "Соберу всё. Лучшее — добавим 😈",
+        parse_mode="Markdown",
     )
 
 
+@dp.callback_query(F.data == "dm_donate_menu")
+async def cb_dm_donate_menu(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "Поддержать проект Stars ⭐\n"
+        "Донат прилетает боту (Stars) — и идёт в развитие.\n"
+        "Выбирай сумму 👇",
+        reply_markup=kb_donate_amounts(),
+    )
+
+
+# =========================
+# /help
+# =========================
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    stats_touch_user(message.from_user.id)
+    await message.answer(
+        "Как играем:\n"
+        "1) В группе: *Начать игру*\n"
+        "2) Все: *Присоединиться*\n"
+        "3) Ведущий: *Погнали*\n"
+        "4) Вопрос → 15 сек → итог → следующий\n\n"
+        "Правила:\n"
+        "— За себя нельзя 😈\n"
+        "— Продление только ведущий\n"
+        "— Лобби тухнет через 5 минут\n"
+        "— Игра закрывается через 10 минут тишины\n\n"
+        "Это между нами 🤫",
+        parse_mode="Markdown",
+    )
+
+
+# =========================
+# GROUP: “Начать игру”
+# =========================
 @dp.message(F.text.casefold() == "начать игру")
 async def start_lobby(message: Message):
+    stats_touch_user(message.from_user.id)
+    stats_touch_chat(message.chat.id)
+
     chat_id = message.chat.id
     gs = GAMES.get(chat_id)
 
-    if gs and gs.state in {State.LOBBY, State.RUNNING, State.PAUSED}:
+    if gs and gs.state in {State.LOBBY, State.RUNNING}:
         await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.")
         return
 
-    gs = GameState(chat_id=chat_id)
-    gs.state = State.LOBBY
-    gs.host_user_id = message.from_user.id
+    gs = GameState(chat_id=chat_id, state=State.LOBBY, host_user_id=message.from_user.id)
+    GAMES[chat_id] = gs
     touch(gs)
     ensure_watchdog(gs)
-    GAMES[chat_id] = gs
 
     await message.answer(
-        "Между нами 🤫\n\nИгра создаётся.\nЖмите «Присоединиться».",
-        reply_markup=kb_lobby(gs),
+        "Между нами 🤫\n\n"
+        "Собираю игроков.\n"
+        "Жмите «Присоединиться».\n\n"
+        "Ведущий — тот, кто начал 😏",
+        reply_markup=kb_group_lobby(),
     )
 
 
 @dp.callback_query(F.data == "cancel")
 async def cb_cancel(cb: CallbackQuery):
     chat_id = cb.message.chat.id
+    gs = GAMES.get(chat_id)
+    if gs:
+        await cleanup_game(gs)
     GAMES.pop(chat_id, None)
+
     await cb.answer("Ок")
     try:
-        await cb.message.edit_text(cancel_phrase())
+        await cb.message.edit_text("Отмена 😏\nИнтрига остаётся.")
     except Exception:
-        await cb.message.answer(cancel_phrase())
+        await cb.message.answer("Отмена 😏\nИнтрига остаётся.")
 
 
 @dp.callback_query(F.data == "join")
@@ -709,25 +857,34 @@ async def cb_join(cb: CallbackQuery):
         await cb.answer("Лобби закрыто. Напиши «Начать игру».", show_alert=True)
         return
 
+    stats_touch_user(cb.from_user.id)
+    stats_touch_chat(chat_id)
+
+    touch(gs)
+    ensure_watchdog(gs)
+
     uid = cb.from_user.id
     if uid in gs.players:
-        await cb.answer("Ты уже в игре 😏", show_alert=False)
+        await cb.answer("Ты уже в игре 😏")
         return
-
     if len(gs.players) >= MAX_PLAYERS:
-        await cb.answer("Уже 10 игроков. Просто наблюдай 😈", show_alert=True)
+        await cb.answer("Уже 10 игроков. Можешь только смотреть 😈", show_alert=True)
         return
 
-    u = cb.from_user
-    label = make_unique_label(gs, u)
-    gs.players[uid] = Player(user_id=uid, name=base_name_from_user(u), label=label)
+    label = make_label(gs, cb.from_user)
+    gs.players[uid] = Player(user_id=uid, label=label)
     gs.join_order.append(uid)
 
-    await cb.answer("Записал ✅", show_alert=False)
+    await cb.answer("Записал ✅")
+
     try:
+        players_text = "\n".join([f"• {gs.players[i].label}" for i in gs.join_order])
         await cb.message.edit_text(
-            "Между нами 🤫\n\nИгра создаётся.\nНажмите «Присоединиться».\n\nВ игре:\n" + format_players(gs),
-            reply_markup=kb_lobby(gs),
+            "Между нами 🤫\n\n"
+            "Собираю игроков.\n"
+            "Жмите «Присоединиться».\n\n"
+            "В игре:\n" + (players_text or "Пока никого."),
+            reply_markup=kb_group_lobby(),
         )
     except Exception:
         pass
@@ -752,9 +909,12 @@ async def cb_start(cb: CallbackQuery):
 
     gs.state = State.RUNNING
     touch(gs)
-    mark_chat_started(chat_id)
 
-    await cb.answer("Поехали")
+    # ВАЖНО: фиксируем, что игра реально стартовала (для ремайндеров)
+    chats_store_mark_game_started(chat_id)
+    stats_inc("games_started", 1)
+
+    await cb.answer("Погнали 😈")
     await start_round(chat_id)
 
 
@@ -763,29 +923,41 @@ async def cb_vote(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING:
-        await cb.answer("Игра не запущена.", show_alert=False)
+        await cb.answer("Игра не запущена.")
         return
 
+    touch(gs)
+
     voter_id = cb.from_user.id
+    if voter_id not in gs.round_voters:
+        await cb.answer("Ты не в этом раунде 😏", show_alert=True)
+        return
     if voter_id in gs.voted_users:
-        await cb.answer(already_voted_phrase(), show_alert=False)
+        await cb.answer(pick(ALREADY_VOTED_VARIANTS))
         return
 
     try:
         target_id = int(cb.data.split(":", 1)[1])
     except Exception:
-        await cb.answer("Кривой голос 🤨", show_alert=False)
+        await cb.answer("Кривой голос 🤨")
         return
 
     if target_id == voter_id:
         await cb.answer("За себя нельзя 😈", show_alert=True)
         return
+    if target_id not in gs.round_targets:
+        await cb.answer("Этого игрока нет в текущем раунде.")
+        return
 
     gs.voted_users.add(voter_id)
     gs.votes_by_target[target_id] = gs.votes_by_target.get(target_id, 0) + 1
     gs.total_votes += 1
+    stats_inc("votes_cast", 1)
 
-    await cb.answer("Засчитано ✅", show_alert=False)
+    if target_id in gs.players:
+        gs.players[target_id].score += 1
+
+    await cb.answer("Засчитано ✅")
 
     if len(gs.voted_users) >= len(gs.round_voters):
         if gs.round_timer_task and not gs.round_timer_task.done():
@@ -798,7 +970,7 @@ async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING:
-        await cb.answer("Неактуально.", show_alert=False)
+        await cb.answer("Неактуально.")
         return
 
     host = get_host(gs)
@@ -806,8 +978,12 @@ async def cb_extend(cb: CallbackQuery):
         await cb.answer("Продлить может только ведущий 😏", show_alert=True)
         return
 
+    if gs.awaiting_next:
+        await cb.answer("Поздно. Уже считаю 😈")
+        return
+
     if gs.extend_used:
-        await cb.answer("Уже продлили 😏", show_alert=False)
+        await cb.answer("Уже продлили 😏")
         try:
             await cb.message.delete()
         except Exception:
@@ -816,12 +992,15 @@ async def cb_extend(cb: CallbackQuery):
         return
 
     gs.extend_used = True
-    await cb.answer(f"+{EXTEND_SECONDS} сек 😏", show_alert=False)
+    touch(gs)
+    await cb.answer(f"+{EXTEND_SECONDS} сек 😏")
 
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
+
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
+    # удаляем служебку “продлить?”
     try:
         await cb.message.delete()
     except Exception:
@@ -834,7 +1013,7 @@ async def cb_force_result(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING:
-        await cb.answer("Неактуально.", show_alert=False)
+        await cb.answer("Неактуально.")
         return
 
     host = get_host(gs)
@@ -842,9 +1021,12 @@ async def cb_force_result(cb: CallbackQuery):
         await cb.answer("Только ведущий может не ждать 😏", show_alert=True)
         return
 
-    await cb.answer("Ок. Не ждём 😈", show_alert=False)
+    touch(gs)
+    await cb.answer("Ок. Не ждём 😈")
+
     if gs.round_timer_task and not gs.round_timer_task.done():
         gs.round_timer_task.cancel()
+
     await show_round_result(chat_id)
 
 
@@ -853,30 +1035,29 @@ async def cb_next(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     gs = GAMES.get(chat_id)
     if not gs or gs.state != State.RUNNING:
-        await cb.answer("Игра не запущена.", show_alert=False)
+        await cb.answer("Игра не запущена.")
         return
 
     if not anti_spam_next_ok(gs, cb.from_user.id):
-        await cb.answer("Тише-тише 😏", show_alert=False)
+        await cb.answer("Тише-тише 😏")
         return
 
     if not gs.awaiting_next:
-        await cb.answer("Сначала дождёмся результата 😈", show_alert=False)
+        await cb.answer("Сначала итог 😈")
         return
 
-    await cb.answer(next_ack_phrase(), show_alert=False)
+    await cb.answer(pick(NEXT_VARIANTS))
     await start_round(chat_id)
 
 
 @dp.callback_query(F.data == "end")
 async def cb_end(cb: CallbackQuery):
-    chat_id = cb.message.chat.id
-    await cb.answer("Ок", show_alert=False)
-    await end_game(chat_id, reason="Игра закрыта 😏")
+    await cb.answer("Ок")
+    await end_game(cb.message.chat.id)
 
 
 # =========================
-# Group приветствие 1 раз при добавлении бота
+# Group welcome only once when BOT added
 # =========================
 @dp.my_chat_member()
 async def on_my_chat_member(update: ChatMemberUpdated):
@@ -891,14 +1072,148 @@ async def on_my_chat_member(update: ChatMemberUpdated):
     if not added:
         return
 
-    if was_group_welcome_sent(chat.id):
+    stats_touch_chat(chat.id)
+
+    if chats_store_welcome_sent(chat.id):
         return
 
     try:
-        await bot.send_message(chat.id, group_welcome_text(), parse_mode="Markdown")
-        mark_group_welcome_sent(chat.id)
+        await bot.send_message(
+            chat.id,
+            "Я тут 😏\n"
+            "Это «Между нами 🤫».\n\n"
+            "Чтобы начать — напишите:\n"
+            "Начать игру 😈\n\n"
+            "/help — правила",
+        )
+        chats_store_mark_welcome(chat.id)
     except Exception:
         return
+
+
+# =========================
+# Suggestions: /suggest
+# =========================
+@dp.message(Command("suggest"))
+async def cmd_suggest(message: Message):
+    stats_touch_user(message.from_user.id)
+
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    suggestion = parts[1].strip() if len(parts) > 1 else ""
+
+    if not suggestion or len(suggestion) < 10:
+        await message.answer("Коротко слишком 😏\nПример:\n/suggest Кто из вас чаще всего…?")
+        return
+
+    data = _read_json(SUGGESTIONS_PATH, [])
+    data.append({
+        "ts": int(time.time()),
+        "user_id": message.from_user.id,
+        "username": message.from_user.username,
+        "chat_id": message.chat.id,
+        "chat_type": message.chat.type,
+        "text": suggestion,
+    })
+    _write_json(SUGGESTIONS_PATH, data)
+    stats_inc("suggestions_count", 1)
+
+    await message.answer("Ок 😈 Записал.\nЕсли вопрос годный — добавим и будем палить вас им.")
+
+    if ADMIN_IDS:
+        preview = suggestion if len(suggestion) <= 350 else suggestion[:350] + "…"
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "💡 Новый предложенный вопрос:\n"
+                    f"{preview}\n\n"
+                    f"От: {message.from_user.id} (@{message.from_user.username})",
+                )
+            except Exception:
+                pass
+
+
+# =========================
+# Stats: /stats (admins only)
+# =========================
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        await message.answer("Не, это не для тебя 😏")
+        return
+
+    stats_init()
+    s = _read_json(STATS_PATH, {})
+    await message.answer(
+        "📊 Статистика бота:\n\n"
+        f"👤 Уник. пользователей: {s.get('users_unique', 0)}\n"
+        f"💬 Уник. чатов: {s.get('chats_unique', 0)}\n"
+        f"🎮 Игр стартовало: {s.get('games_started', 0)}\n"
+        f"🌀 Раундов сыграно: {s.get('rounds_played', 0)}\n"
+        f"🗳 Голосов: {s.get('votes_cast', 0)}\n"
+        f"⭐ Донатов (Stars): {s.get('donations_stars_total', 0)} / {s.get('donations_count', 0)} платежей\n"
+        f"💡 Предложений вопросов: {s.get('suggestions_count', 0)}"
+    )
+
+
+# =========================
+# Donations: /donate + Stars invoices
+# =========================
+@dp.message(Command("donate"))
+async def cmd_donate(message: Message):
+    stats_touch_user(message.from_user.id)
+    await message.answer(
+        "Поддержать проект Stars ⭐\n"
+        "Донат улетает боту (Stars) — мы вкладываем в развитие.\n"
+        "Выбирай сумму 👇",
+        reply_markup=kb_donate_amounts(),
+    )
+
+
+@dp.callback_query(F.data.startswith("donate:"))
+async def cb_donate(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        amount = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.message.answer("Что-то пошло не так 😏")
+        return
+    if amount <= 0:
+        await cb.message.answer("Слишком хитро 😈")
+        return
+
+    prices = [LabeledPrice(label="Донат на развитие", amount=amount)]
+
+    await bot.send_invoice(
+        chat_id=cb.from_user.id,
+        title="Поддержка «Между нами 🤫»",
+        description="Добровольный донат Stars на развитие проекта.",
+        payload=f"donate_{amount}_{int(time.time())}",
+        provider_token="",
+        currency="XTR",
+        prices=prices,
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(pre: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    sp = message.successful_payment
+    stars = int(getattr(sp, "total_amount", 0) or 0)
+
+    stats_inc("donations_count", 1)
+    stats_inc("donations_stars_total", stars)
+
+    await message.answer(
+        f"Принято ⭐ {stars}\n"
+        "Спасибо 😏\n"
+        "Мы это превратим в ещё более колкие вопросы 😈"
+    )
 
 
 # =========================
@@ -906,9 +1221,12 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 # =========================
 async def main():
     global BOT_USERNAME
+
+    stats_init()
+
     me = await bot.get_me()
     BOT_USERNAME = (me.username or "").strip()
-    print(f"✅ Bot started as @{BOT_USERNAME}")
+    print(f"✅ Started as @{BOT_USERNAME}")
 
     asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
