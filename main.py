@@ -28,7 +28,7 @@ MIN_PLAYERS = 2
 ROUND_VOTE_SECONDS = 15
 EXTEND_SECONDS = 15
 
-# TЗ: 5 минут → закрыть лобби, 10 минут → закрыть сессию
+# ТЗ: 5 минут → закрыть лобби, 10 минут → закрыть сессию
 LOBBY_CLOSE_SEC = 5 * 60
 SESSION_CLOSE_SEC = 10 * 60
 
@@ -43,7 +43,7 @@ REMIND_CHECK_SEC = 60 * 60            # проверка раз в час
 
 
 # =========================
-# QUESTIONS (44 total)
+# QUESTIONS
 # =========================
 NORMAL_QUESTIONS = [
     "Кто чаще всего делает вид, что всё понял — хотя вообще не понял?",
@@ -139,7 +139,7 @@ class GameState:
     used_normal: Set[int] = field(default_factory=set)
     used_spicy: Set[int] = field(default_factory=set)
 
-    # TЗ: острые каждые 3–4; фирменная вставка каждые 4–5
+    # острые каждые 3–4; фирменная вставка каждые 4–5
     since_last_spicy: int = 0
     next_spicy_at: int = field(default_factory=lambda: random.randint(3, 4))
 
@@ -291,6 +291,47 @@ def get_host(gs: GameState) -> Optional[int]:
 
 
 # =========================
+# RESULT TEXT HELPERS (чтобы не падало)
+# =========================
+def reaction_for_result(items: List[Tuple[int, int]], total_votes: int) -> str:
+    if total_votes <= 0 or not items:
+        return "Слишком тихо… даже подозрительно 🤨"
+
+    top = items[0][1]
+    second = items[1][1] if len(items) > 1 else 0
+
+    if top == total_votes:
+        return "Единогласно. Тут даже обсуждать нечего 😈"
+
+    top_count = sum(1 for _, c in items if c == top)
+    if top_count > 1:
+        return "Мнения разделились. Интересно… 🤫"
+
+    if top - second == 1:
+        return "На тоненького. Едва-едва 😏"
+
+    if top >= max(2, second * 2):
+        return "Похоже, всё очевидно. Запомним 🫠"
+
+    return "Ну… почти договорились 😏"
+
+
+def final_top3_text(gs: GameState) -> str:
+    if not gs.players:
+        return "Игра окончена. Никого не осталось 🤷‍♂️"
+
+    arr = sorted(gs.players.values(), key=lambda p: p.score, reverse=True)
+    rounds = gs.round
+
+    lines = [f"Финал 😈", f"Сыграли: {rounds} раунд(ов)\n", "Чаще всего выбирали:"]
+    for p in arr[:3]:
+        lines.append(f"— {p.label} — {p.score}")
+
+    lines.append("\nЕсли было интересно — добавь меня в другой чат 😉\nЭто между нами 🤫")
+    return "\n".join(lines)
+
+
+# =========================
 # REMINDERS
 # =========================
 def _load_chats_store() -> Dict[str, Dict]:
@@ -302,14 +343,13 @@ def _load_chats_store() -> Dict[str, Dict]:
     except Exception:
         return {}
 
+
 def _save_chats_store(data: Dict[str, Dict]) -> None:
     p = Path(CHATS_STORE_PATH)
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
 def mark_chat_started(chat_id: int) -> None:
-    """
-    Фиксируем, что игра в этом чате реально стартовала.
-    """
     data = _load_chats_store()
     key = str(chat_id)
     now = int(time.time())
@@ -319,11 +359,8 @@ def mark_chat_started(chat_id: int) -> None:
     data[key] = meta
     _save_chats_store(data)
 
+
 async def reminder_loop():
-    """
-    Раз в час проверяет чаты, где игра стартовала,
-    и если 3 дня тишины — зовёт сыграть снова (1 раз после последнего старта).
-    """
     while True:
         try:
             await asyncio.sleep(REMIND_CHECK_SEC)
@@ -342,11 +379,9 @@ async def reminder_loop():
                 if last_started <= 0:
                     continue
 
-                # прошло 3 дня с момента старта игры
                 if now - last_started < REMIND_EVERY_SEC:
                     continue
 
-                # напомнить только один раз после последнего старта
                 if last_reminded >= last_started:
                     continue
 
@@ -384,7 +419,6 @@ def kb_lobby(gs: GameState):
 
 
 def kb_vote(gs: GameState):
-    # Важно: во время вопроса НЕ показываем кнопку "добавить"
     b = InlineKeyboardBuilder()
     targets = [(uid, gs.players[uid]) for uid in gs.round_targets if uid in gs.players]
     targets.sort(key=lambda x: x[1].label.lower())
@@ -503,9 +537,6 @@ async def start_round(chat_id: int):
     gs.current_is_spicy = is_spicy
     gs.current_has_secret = has_secret
 
-    # формат B:
-    # **ВОПРОС КАПС**
-    # _Только честно. Это между нами 🤫_
     q_line = md_bold_caps(q)
 
     secret_line = "\n\n" + md_italic("Только честно. Это между нами 🤫") if has_secret else ""
@@ -654,7 +685,8 @@ async def cmd_start(message: Message):
         "Между нами 🤫\n\n"
         "Добавь меня в чат — и напиши:\n"
         "«Начать игру»\n\n"
-        "/help — правила"
+        "/help — правила\n"
+        "/reset — сброс зависшей игры"
     )
 
 
@@ -673,6 +705,25 @@ async def cmd_help(message: Message):
     )
 
 
+# АВАРИЙНЫЙ СБРОС, если игра “якобы идёт”, но управлять нельзя
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message):
+    chat_id = message.chat.id
+    if chat_id not in GAMES:
+        await message.answer("Игры сейчас нет 😏")
+        return
+    await end_game(chat_id, reason="Ок. Сбросил игру 🧹\nМожно начинать заново: «Начать игру»")
+
+
+@dp.message(F.text.casefold() == "сброс")
+async def txt_reset(message: Message):
+    chat_id = message.chat.id
+    if chat_id not in GAMES:
+        await message.answer("Игры сейчас нет 😏")
+        return
+    await end_game(chat_id, reason="Ок. Сбросил игру 🧹\nМожно начинать заново: «Начать игру»")
+
+
 # =========================
 # START LOBBY (text trigger)
 # =========================
@@ -682,7 +733,7 @@ async def start_lobby(message: Message):
     gs = GAMES.get(chat_id)
 
     if gs and gs.state in {State.LOBBY, State.RUNNING, State.PAUSED}:
-        await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.")
+        await message.answer("Игра уже идёт 😏\nЖмите кнопки под сообщениями.\n\nЕсли всё зависло — /reset")
         return
 
     gs = GameState(chat_id=chat_id)
@@ -794,7 +845,7 @@ async def cb_start(cb: CallbackQuery):
     gs.state = State.RUNNING
     touch(gs)
 
-    mark_chat_started(chat_id)  # Запоминаем, что игра началась
+    mark_chat_started(chat_id)
 
     await cb.answer("Поехали")
     await start_round(chat_id)
@@ -849,6 +900,9 @@ async def cb_vote(cb: CallbackQuery):
         await show_round_result(chat_id)
 
 
+# =========================
+# FIX: extend НЕ УБИВАЕТ КНОПКИ
+# =========================
 @dp.callback_query(F.data == "extend")
 async def cb_extend(cb: CallbackQuery):
     chat_id = cb.message.chat.id
@@ -868,10 +922,17 @@ async def cb_extend(cb: CallbackQuery):
         gs.round_timer_task.cancel()
     gs.round_timer_task = asyncio.create_task(round_timer(chat_id, EXTEND_SECONDS))
 
+    # ВАЖНО: при edit_text всегда передаём reply_markup, иначе кнопки исчезнут
     try:
-        await cb.message.edit_text(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
+        await cb.message.edit_text(
+            f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈",
+            reply_markup=kb_not_all_voted(),
+        )
     except Exception:
-        await cb.message.answer(f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈")
+        await cb.message.answer(
+            f"Ладно.\nЕщё {EXTEND_SECONDS} секунд. Дожимайте 😈",
+            reply_markup=kb_not_all_voted(),
+        )
 
 
 @dp.callback_query(F.data == "force_result")
@@ -985,7 +1046,7 @@ async def cb_end(cb: CallbackQuery):
 # MAIN
 # =========================
 async def main():
-    asyncio.create_task(reminder_loop())  # Запуск напоминаний
+    asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
 
 
